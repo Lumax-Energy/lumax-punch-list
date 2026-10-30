@@ -486,6 +486,8 @@ const DEFAULT_SETTINGS = {
   photo_quality: 0.82,
   last_backup_at: "",       // set by each successful backup; drives the home reminder
   last_backup_full: false,
+  last_full_backup_at: "",  // full backups only: the photos' own reminder clock
+  photos_changed_at: "",    // a photo was added, re-tagged or captioned
 };
 /* ============================================================================
    docx.js — a small, self-contained Word (.docx) writer.
@@ -700,7 +702,9 @@ const DocxKit = (function () {
     const name = "image" + this.media.length + "." + (img.ext === "png" ? "png" : "jpeg");
     this.media.push({ name: name, data: img.bytes, rid: rid });
 
-    const ratio = img.h / img.w;
+    // A photo restored from a damaged backup can lack its size. NaN in the
+    // XML makes Word refuse the whole file, so fall back to 4:3.
+    const ratio = img.w > 0 && img.h > 0 && isFinite(img.h / img.w) ? img.h / img.w : 0.75;
     let wmm = maxWmm;
     let hmm = wmm * ratio;
     if (maxHmm && hmm > maxHmm) { hmm = maxHmm; wmm = hmm / ratio; }
@@ -953,8 +957,12 @@ const Store = (function () {
     const out = Object.assign(blank(), s);
     out.settings = Object.assign({}, DEFAULT_SETTINGS, isObj(s.settings) ? s.settings : {});
     asText(out.settings, ["company_name", "report_title", "company_footer", "inspection_prefix",
-      "inspector_name", "risk_legend", "legend", "last_backup_at"]);
+      "inspector_name", "risk_legend", "legend", "last_backup_at", "last_full_backup_at", "photos_changed_at"]);
     out.settings.last_backup_full = out.settings.last_backup_full === true;
+    // Data saved before the photo clock existed: its last backup, if full, is it.
+    if (!out.settings.last_full_backup_at && out.settings.last_backup_full) {
+      out.settings.last_full_backup_at = out.settings.last_backup_at || "";
+    }
     out.settings.photo_max_edge = asNum(out.settings.photo_max_edge) || DEFAULT_SETTINGS.photo_max_edge;
     out.settings.photo_quality = asNum(out.settings.photo_quality) || DEFAULT_SETTINGS.photo_quality;
     ["projects", "inspections", "snags", "templates", "remarks", "revisions"].forEach(function (k) {
@@ -970,6 +978,8 @@ const Store = (function () {
       asText(sn, ["id", "inspection_id", "code", "block_table", "support_no", "location_text", "category",
         "description", "required_action", "contractor_response", "due_date", "priority"]);
       sn.photos = asIds(sn.photos);
+      // Codes this snag had before a merge renumbered its inspection.
+      sn.previous_codes = asIds(sn.previous_codes);
       sn.references = Array.isArray(sn.references) ? sn.references.filter(isObj) : [];
       sn.references.forEach(function (r) { asText(r, ["ref_type", "document", "detail"]); });
       sn.history = Array.isArray(sn.history) ? sn.history.filter(isObj) : [];
@@ -990,6 +1000,7 @@ const Store = (function () {
         "inspector_name", "client_qc_name", "status", "general_remarks", "technical_notes",
         "site_photo_id", "site_plan_id"]);
       i.photos = asIds(i.photos);
+      i.previous_numbers = asIds(i.previous_numbers);
       if (i.general_remarks == null) i.general_remarks = "";
       if (i.technical_notes == null) i.technical_notes = "";
       i.rev = asNum(i.rev) || 0;
@@ -1161,6 +1172,8 @@ const Store = (function () {
       created_at: new Date().toISOString(),
     };
     await idbPut("photos", rec);
+    // Only a full backup holds this photo; the caller's save() stores this.
+    state.settings.photos_changed_at = rec.created_at;
     return rec;
   }
 
@@ -1322,9 +1335,13 @@ const Store = (function () {
     return out;
   }
 
+  /** Returns { blob, at }. The data is copied first and `at` is that
+   *  moment: reading every photo can take a while, and anything edited
+   *  meanwhile is not in the file, so it must not count as backed up. */
   async function backup(withPhotos) {
-    const payload = { format: "lumax-punchlist-backup", version: 1, exported_at: new Date().toISOString(), state: state, photos: [] };
-    if (!withPhotos) return new Blob([JSON.stringify(payload)], { type: "application/json" });
+    const at = new Date().toISOString();
+    const payload = { format: "lumax-punchlist-backup", version: 1, exported_at: at, state: JSON.parse(JSON.stringify(state)), photos: [] };
+    if (!withPhotos) return { blob: new Blob([JSON.stringify(payload)], { type: "application/json" }), at: at };
     const files = [];
     const names = new Set();
     const all = await idbAll("photos");
@@ -1346,12 +1363,12 @@ const Store = (function () {
       payload.photos.push(meta);
     }
     files.unshift({ name: "backup.json", data: new TextEncoder().encode(JSON.stringify(payload)) });
-    return zipBlob(files);
+    return { blob: await zipBlob(files), at: at };
   }
 
   /** Read a backup file: a full backup .zip, or a .json (a data-only
    *  backup, or a full backup from before photos moved into a zip).
-   *  Returns { json, files } where files maps zip paths to Blobs. */
+   *  Returns { json, files } where files maps zip paths to { blob, crc }. */
   async function openBackup(file) {
     const head = await toBytes(file.slice(0, 4));
     const isZip = head && head.length === 4 && head[0] === 0x50 && head[1] === 0x4b && head[2] === 3 && head[3] === 4;
@@ -1361,19 +1378,17 @@ const Store = (function () {
     if (!main) throw new Error("That .zip is not a Lumax Punch List backup.");
     const bytes = await toBytes(main.blob);
     if (DocxKit.crc32(bytes) !== main.crc) throw new Error(ZIP_DAMAGED);
-    const files = new Map();
-    entries.forEach(function (e, name) { files.set(name, e.blob); });
-    return { json: JSON.parse(new TextDecoder().decode(bytes)), files: files };
+    // Each photo keeps its CRC, so restore() can check its bytes too.
+    return { json: JSON.parse(new TextDecoder().decode(bytes)), files: entries };
   }
 
   /** Each phone counts inspection numbers on its own, so a merge can bring
    *  in a different inspection under a number already used here. Give the
-   *  backup's copy the next free number and re-code its snags. Inspections
-   *  already on this device never change: their numbers may be on issued
-   *  reports. Returns [{ from, to }]. */
+   *  backup's copy the next free number; commitRestore re-codes its snags.
+   *  Inspections already on this device never change: their numbers may be
+   *  on issued reports. Returns [{ from, to }]. */
   function renumberClashes(incoming, counters) {
     const localInsp = new Set(state.inspections.map(function (i) { return i.id; }));
-    const localSnag = new Set(state.snags.map(function (s) { return s.id; }));
     const claimed = new Set(state.inspections.map(function (i) { return i.number; }));
     // Every number in either copy, so a new number never lands on one the
     // backup itself uses further down the list.
@@ -1398,16 +1413,32 @@ const Store = (function () {
       taken.add(to); claimed.add(to);
       const from = insp.number;
       insp.number = to;
-      // Snag codes start with the inspection number. snag_number stays, so
-      // only the front of each code moves.
-      incoming.snags.forEach(function (sn) {
-        if (sn.inspection_id !== insp.id || localSnag.has(sn.id)) return;
-        if (sn.snag_number != null) sn.code = to + "-" + String(sn.snag_number).padStart(3, "0");
-        else if (sn.code && sn.code.indexOf(from + "-") === 0) sn.code = to + sn.code.slice(from.length);
-      });
+      // Kept on the record, so a report already issued under the old number
+      // can still be traced to this inspection after the toast has gone.
+      insp.previous_numbers = (insp.previous_numbers || []).concat(from);
       out.push({ from: from, to: to });
     });
     return out;
+  }
+
+  /** Snag codes start with the inspection number. A new snag from a backup
+   *  can belong to an inspection numbered differently here: renumbered in
+   *  this merge, or in an earlier merge from the same phone, which still
+   *  uses the old number. Move the front of its code to this device's
+   *  number, so no two snags here share a code. */
+  function recodeSnags(snags, inspections, backupNumber) {
+    const numberOf = new Map(inspections.map(function (i) { return [i.id, i.number]; }));
+    snags.forEach(function (sn) {
+      const to = numberOf.get(sn.inspection_id);
+      if (!to || (sn.code && sn.code.indexOf(to + "-") === 0)) return;
+      const from = backupNumber.get(sn.inspection_id);
+      let code = sn.code;
+      if (sn.snag_number != null) code = to + "-" + String(sn.snag_number).padStart(3, "0");
+      else if (from && sn.code && sn.code.indexOf(from + "-") === 0) code = to + sn.code.slice(from.length);
+      if (code === sn.code) return;
+      if (sn.code) sn.previous_codes = (sn.previous_codes || []).concat(sn.code);
+      sn.code = code;
+    });
   }
 
   /** Swap in the restored state and save it. On failure the state in
@@ -1427,12 +1458,18 @@ const Store = (function () {
       Object.keys(localC).concat(Object.keys(inC)).forEach(function (y) {
         merged[y] = Math.max(Number(localC[y]) || 0, Number(inC[y]) || 0);
       });
+      // The number each inspection has in the backup, before any renumbering.
+      const backupNumber = new Map(incoming.inspections.map(function (i) { return [i.id, i.number]; }));
       renumbered = renumberClashes(incoming, merged);
+      const added = [];
       ["projects", "inspections", "snags", "revisions", "templates", "remarks"].forEach(function (k) {
         const have = new Set(state[k].map(function (x) { return x.id; }));
-        next[k] = state[k].concat(incoming[k].filter(function (x) { return !have.has(x.id); }));
+        const fresh = incoming[k].filter(function (x) { return !have.has(x.id); });
+        if (k === "snags") added.push.apply(added, fresh);
+        next[k] = state[k].concat(fresh);
       });
       next.counters = merged;
+      recodeSnags(added, next.inspections, backupNumber);
     }
     const prev = state;
     state = next;
@@ -1445,8 +1482,8 @@ const Store = (function () {
     return renumbered;
   }
 
-  /** `files` is the zip's path → Blob map from openBackup(); null for a
-   *  .json backup, whose photos (if any) are base64 inside it. */
+  /** `files` is the zip's path → { blob, crc } map from openBackup(); null
+   *  for a .json backup, whose photos (if any) are base64 inside it. */
   async function restore(json, mode, files) {
     if (!json || json.format !== "lumax-punchlist-backup") {
       throw new Error("That file is not a Lumax Punch List backup.");
@@ -1456,26 +1493,37 @@ const Store = (function () {
     // fails cleanly instead of half way through.
     // Photo ids end up in attributes and the thumb in an img src, so they
     // get the same type checks as the state.
-    const photos = (Array.isArray(json.photos) ? json.photos : []).filter(function (p) {
-      return isObj(p) && p.id != null && p.id !== "";
-    }).map(function (p) {
+    // A size must be a positive number: the Word export divides by it.
+    const size = function (v) { const n = asNum(v); return n > 0 ? n : null; };
+    const photos = [];
+    let skipped = 0;
+    for (const p of (Array.isArray(json.photos) ? json.photos : [])) {
+      if (!isObj(p) || p.id == null || p.id === "") continue;
       let blob;
       if (p.file != null && p.file !== "") {
-        // Zip backup: the photo is a slice of the file, stored as it is.
-        const part = files && files.get(String(p.file));
+        // backup.json on its own: the phone or computer unzipped the backup
+        // and kept only the folder. Restore the data; the photos show up as
+        // missing rather than blocking everything else.
+        if (!files) { skipped++; continue; }
+        const part = files.get(String(p.file));
         if (!part) throw new Error("The backup is missing the photo file " + p.file + ".");
-        blob = part.slice(0, part.size, "image/jpeg");
+        // Read and check each photo now, one at a time, and keep a copy of
+        // its bytes: damaged bytes never replace a good photo here, and the
+        // save does not depend on the picked file still being readable.
+        const bytes = await toBytes(part.blob);
+        if (!bytes || DocxKit.crc32(bytes) !== part.crc) throw new Error(ZIP_DAMAGED);
+        blob = new Blob([bytes], { type: "image/jpeg" });
       } else {
         blob = b64ToBlob(p.data, "image/jpeg");
       }
-      return {
+      photos.push({
         id: String(p.id), blob: blob,
         thumb: typeof p.thumb === "string" && p.thumb.indexOf("data:image/") === 0 ? p.thumb : null,
-        w: asNum(p.w), h: asNum(p.h),
+        w: size(p.w), h: size(p.h),
         kind: p.kind === "after" || p.kind === "closeout" ? p.kind : "before",
         caption: p.caption == null ? "" : String(p.caption), created_at: p.created_at == null ? "" : String(p.created_at),
-      };
-    });
+      });
+    }
     // Add the backup's new photos before deleting or changing any. If anything
     // fails before the restored state is saved, the ones added are removed
     // again, so the device is left exactly as it was.
@@ -1514,7 +1562,7 @@ const Store = (function () {
     const have = new Set(present);
     let missing = 0;
     referenced(state).forEach(function (id) { if (!have.has(id)) missing++; });
-    return { missingPhotos: missing, renumbered: renumbered };
+    return { missingPhotos: missing, renumbered: renumbered, photosLeftOut: skipped };
   }
 
   async function usage() {
@@ -1829,6 +1877,9 @@ const Report = (function () {
       K.text("Revision: " + revNumber + "        Date: " + (insp.inspection_date || ""), { size: 10, align: "right", spaceAfter: 1 }),
       insp.next_inspection_date ? K.text("Next revision: " + insp.next_inspection_date, { size: 10, align: "right", spaceAfter: 1 }) : "",
       K.text("Inspection No: " + insp.number, { size: 10, bold: true, align: "right" }),
+      // A merge renumbered it: the old number may be on reports already sent.
+      (insp.previous_numbers || []).length
+        ? K.text("Formerly: " + insp.previous_numbers.join(", "), { size: 9, align: "right" }) : "",
     ].join("");
     doc.add(K.table([3400, 6680], [K.row([
       K.cell(logo ? K.para(logo) : K.text(set.company_name || "", { size: 12, bold: true, color: NAVY }),
@@ -2051,14 +2102,19 @@ const Report = (function () {
   const CSV_COLUMNS = ["Snag ID", "Project", "Area", "Inspection", "Block/Table", "Support No",
     "Location", "Category", "Risk", "Description", "Required Action", "Contractor Response",
     "Due Date", "Priority", "Status", "Inspector", "Created", "Updated", "GPS Lat", "GPS Lng",
-    "Photos", "References", "Last status note"];
+    "Photos", "References", "Last status note", "Former Snag ID"];
 
   function buildCsv(insp, mode) {
     const project = projectOf(insp);
     const snags = filterSnags(snagsOf(insp.id), mode);
     const q = function (v) {
-      const s = v == null ? "" : String(v);
-      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+      let s = v == null ? "" : String(v);
+      // The register goes to clients and contractors, and Excel runs a cell
+      // starting with = + - @ as a formula, quoted or not. A leading ' keeps
+      // it as text. Numbers (a negative GPS reading) are left alone.
+      if (typeof v === "string" && /^[=+\-@\t\r]/.test(s)) s = "'" + s;
+      // A bare \r ends the row in Excel too, so it is quoted like \n.
+      return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
     const lines = [CSV_COLUMNS.join(",")];
     snags.forEach(function (s) {
@@ -2068,7 +2124,8 @@ const Report = (function () {
         s.due_date, s.priority, STATUS_LABEL[s.status] || s.status, insp.inspector_name,
         localStamp(s.created_at, true), localStamp(s.updated_at, true),
         s.lat == null ? "" : s.lat, s.lng == null ? "" : s.lng,
-        (s.photos || []).length, refsLine(s), last ? last.comment : ""].map(q).join(","));
+        (s.photos || []).length, refsLine(s), last ? last.comment : "",
+        (s.previous_codes || []).join("; ")].map(q).join(","));
     });
     return new Blob(["\ufeff" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
   }
@@ -2205,17 +2262,38 @@ function canShareFile(filename) {
 
 /** Send a file through the share sheet (mail, WhatsApp, Drive…). Resolves
  *  "shared", "cancelled" or "downloaded": any failure other than the user
- *  backing out falls back to a normal download, so the file is never lost. */
-async function shareBlob(blob, filename) {
+ *  backing out falls back to a normal download, so the file is never lost.
+ *  With `afterWait`, a refusal because the tap was too long ago resolves
+ *  "expired" instead, so the caller can ask for a fresh tap. */
+async function shareBlob(blob, filename, afterWait) {
   try {
     await navigator.share({ files: [fileFor(blob, filename)], title: filename });
     return "shared";
   } catch (err) {
     if (err && err.name === "AbortError") return "cancelled";
+    if (afterWait && err && err.name === "NotAllowedError") return "expired";
     console.warn("Share failed, downloading instead", err);
     saveBlob(blob, filename);
     return "downloaded";
   }
+}
+
+/** Share a file that took a while to build. Browsers only open the share
+ *  sheet within a few seconds of a tap, so if that has passed, show the file
+ *  as ready with a Share now button: a fresh tap. Resolves like shareBlob;
+ *  closing that sheet counts as "cancelled". */
+function shareBuilt(blob, filename) {
+  return shareBlob(blob, filename, true).then(function (how) {
+    if (how !== "expired") return how;
+    return new Promise(function (res) {
+      UI.hideToast();
+      App.modal = { type: "share" };   // so Escape closes it
+      App.shareReady = { blob: blob, filename: filename, done: res };
+      UI.openModal(UI.sheetHead("Ready to share") + '<div class="sheet-b">' +
+        '<p style="margin:0 0 12px"><b>' + esc(filename) + "</b> (" + esc(fmtBytes(blob.size)) + ") is ready.</p>" +
+        '<button class="btn btn-p" data-a="share-ready">Share now</button></div>');
+    });
+  });
 }
 /* ============================================================================
    Views. Every screen is a string of HTML; buttons carry data-a="action" and
@@ -2226,6 +2304,7 @@ const App = {
   route: "home", inspId: null, tab: "snags", snagId: null,
   filter: "all", query: "", placing: false, pinFor: null, modal: null, busy: false,
   backupNagHidden: false,   // the home backup reminder, dismissed until the next load
+  shareReady: null,         // a built file waiting for its Share now tap
 };
 
 const UI = (function () {
@@ -2353,8 +2432,20 @@ const UI = (function () {
     if (!st.projects.length && !st.inspections.length && !st.snags.length) return null;
     const last = Date.parse(st.settings.last_backup_at || "");
     if (isNaN(last)) return { never: true };
+    // A data-only backup leaves the photos on this phone alone, so they have
+    // their own clock: the last full backup.
+    const full = Date.parse(st.settings.last_full_backup_at || "");
+    const hasPhotos = st.snags.some(function (s) { return (s.photos || []).length; }) ||
+      st.inspections.some(function (i) { return (i.photos || []).length || i.site_photo_id || i.site_plan_id; });
+    if (hasPhotos && isNaN(full)) return { photosNever: true };
+    const day = 24 * 60 * 60 * 1000;
     // A day's grace after each backup, and no reminder when nothing changed.
-    if (Date.now() - last < 24 * 60 * 60 * 1000 || !(Date.parse(st.updated_at) > last)) return null;
+    if (Date.now() - last < day || !(Date.parse(st.updated_at) > last)) {
+      if (hasPhotos && Date.now() - full >= day && Date.parse(st.settings.photos_changed_at || "") > full) {
+        return { photosAt: st.settings.last_full_backup_at };
+      }
+      return null;
+    }
     const after = function (iso) { return Date.parse(iso || "") > last; };
     return {
       at: st.settings.last_backup_at,
@@ -2367,7 +2458,11 @@ const UI = (function () {
     const due = App.backupNagHidden ? null : backupDue();
     if (!due) return "";
     let text = "This phone holds the only copy — back up now";
-    if (!due.never) {
+    if (due.photosNever) {
+      text = "Photos have never been backed up — this phone holds the only copy";
+    } else if (due.photosAt) {
+      text = "Photos not backed up since " + localStamp(due.photosAt) + " — new or changed photos are only on this phone";
+    } else if (!due.never) {
       const bits = [];
       if (due.snags) bits.push(due.snags + " snag" + (due.snags > 1 ? "s" : "") + " changed");
       if (due.inspections) bits.push(due.inspections + " new inspection" + (due.inspections > 1 ? "s" : ""));
@@ -2387,7 +2482,7 @@ const UI = (function () {
     let hits = "";
     if (q.length > 1) {
       const found = st.snags.filter(function (s) {
-        return (s.code + " " + s.description + " " + s.block_table + " " + s.location_text +
+        return (s.code + " " + (s.previous_codes || []).join(" ") + " " + s.description + " " + s.block_table + " " + s.location_text +
           " " + s.required_action).toLowerCase().indexOf(q) >= 0;
       }).slice(0, 40);
       hits = '<div class="card"><div class="card-h"><h2>Search results</h2><span class="count">' +
@@ -2516,6 +2611,9 @@ const UI = (function () {
     return '<div class="stack">' +
       '<div class="card"><div class="card-h"><h2>Inspection</h2><span class="mono muted">' + esc(insp.number) + "</span></div>" +
       '<div class="card-b">' +
+      ((insp.previous_numbers || []).length
+        ? '<p class="muted" style="margin:0 0 10px">Formerly <span class="mono">' + esc(insp.previous_numbers.join(", ")) +
+          "</span>: renumbered when a backup from another phone was merged.</p>" : "") +
       field("Project", select("project_id", insp.project_id, st.projects.map(function (x) { return [x.id, x.name || "Untitled"]; }))) +
       '<div class="grid2">' +
       field("Project area", input("area", insp.area, { placeholder: "e.g. Carport block CP8" })) +
@@ -2694,7 +2792,10 @@ const UI = (function () {
       '<div class="card"><div class="card-h"><h2>Backup & restore</h2></div><div class="card-b stack">' +
       '<p style="margin:0">Last backup: ' + (s.last_backup_at
         ? "<b>" + esc(localStamp(s.last_backup_at, true)) + "</b> (" + (s.last_backup_full ? "full" : "data only") + ")"
-        : "<b>never</b>") + "</p>" +
+        : "<b>never</b>") +
+      (s.last_backup_at && !s.last_backup_full
+        ? "<br>Last with photos: <b>" + (s.last_full_backup_at ? esc(localStamp(s.last_full_backup_at, true)) : "never") + "</b>" : "") +
+      "</p>" +
       withShare('<button class="btn btn-p" data-a="backup" data-v="full">Back up everything (with photos)</button>',
         'data-a="backup" data-v="full"', "x.zip", "full backup") +
       withShare('<button class="btn" data-a="backup" data-v="light">Back up data only (small, no photos)</button>',
@@ -2782,6 +2883,8 @@ const UI = (function () {
   function closeModal() {
     document.getElementById("modal").innerHTML = "";
     App.modal = null;
+    // A built file closed without its Share now tap was not sent.
+    if (App.shareReady) { const r = App.shareReady; App.shareReady = null; r.done("cancelled"); }
   }
   function sheetHead(title, extra) {
     return '<div class="sheet-h"><h2>' + esc(title) + "</h2>" + (extra || "") +
@@ -3509,6 +3612,9 @@ const UI = (function () {
       const order = ["before", "after", "closeout"];
       p.kind = order[(order.indexOf(p.kind) + 1) % order.length];
       await Store.idbPut("photos", p);
+      // Kinds live with the photo, so only a full backup carries the change.
+      Store.get().settings.photos_changed_at = new Date().toISOString();
+      Store.save();
       el.textContent = p.kind === "closeout" ? "Close-out" : p.kind === "after" ? "After" : "Before";
       UI.toast("Marked " + el.textContent.toLowerCase());
     },
@@ -3613,7 +3719,7 @@ const UI = (function () {
         const blob = await Report.buildDocx(i, mode, i.rev || 0);
         const name = Report.fileBase(i, mode, i.rev || 0) + ".docx";
         let how = "downloaded";
-        if (share) how = await shareBlob(blob, name);
+        if (share) how = await shareBuilt(blob, name);
         else saveBlob(blob, name);
         if (how === "cancelled") UI.hideToast();
         else UI.toast((how === "shared" ? "Shared " : "Downloaded ") + fmtBytes(blob.size));
@@ -3650,25 +3756,38 @@ const UI = (function () {
       const withPhotos = el.getAttribute("data-v") === "full";
       UI.toast("Preparing backup…", false, 20000);
       try {
-        const blob = await Store.backup(withPhotos);
+        const made = await Store.backup(withPhotos);
+        const blob = made.blob;
         const name = "LumaxPunchList_backup_" + today() + (withPhotos ? "_full.zip" : "_data.json");
         let how = "downloaded";
-        if (el.hasAttribute("data-share")) how = await shareBlob(blob, name);
+        if (el.hasAttribute("data-share")) how = await shareBuilt(blob, name);
         else saveBlob(blob, name);
         // Backing out of the share sheet saved nothing, so it is not a backup.
         if (how === "cancelled") return UI.hideToast();
         const s = Store.get().settings;
+        // Edits made while the file was built are not in it.
+        const editedSince = Date.parse(Store.get().updated_at) > Date.parse(made.at);
         s.last_backup_full = withPhotos;
+        if (withPhotos) s.last_full_backup_at = made.at;
         Store.save();
         // save() has just stamped updated_at; take the same moment, so this
         // save is not itself counted as a change since the backup. The write
         // is debounced, so it still carries the value set here.
-        s.last_backup_at = Store.get().updated_at;
+        s.last_backup_at = editedSince ? made.at : Store.get().updated_at;
         UI.render();
         UI.toast((how === "shared" ? "Backup shared · " : "Backup saved · ") + fmtBytes(blob.size));
       } catch (err) {
         UI.toast("Backup failed: " + (err.message || err), true, 7000);
       }
+    },
+    "share-ready": function () {
+      const r = App.shareReady;
+      if (!r) return;
+      App.shareReady = null;
+      // Straight from this tap, before anything waits, so the sheet may open.
+      const p = shareBlob(r.blob, r.filename);
+      UI.closeModal();
+      p.then(r.done);
     },
     "hide-backup-nag": function () { App.backupNagHidden = true; UI.render(); },
     "restore": async function () {
@@ -3690,7 +3809,11 @@ const UI = (function () {
           msg += " · " + rn.length + " inspection" + (rn.length > 1 ? "s" : "") + " renumbered: " +
             rn.map(function (r) { return r.from + " → " + r.to; }).join(", ");
         }
-        if (res.missingPhotos) {
+        if (res.missingPhotos && res.photosLeftOut) {
+          // backup.json without its photos folder: the data is back, the photos are not.
+          UI.toast(msg + " · " + res.missingPhotos + " photo" + (res.missingPhotos > 1 ? "s are" : " is") +
+            " not on this device: that was backup.json on its own. Restore the original _full.zip to bring them back.", true, 9000);
+        } else if (res.missingPhotos) {
           UI.toast(msg + " · " + res.missingPhotos + " photo" + (res.missingPhotos > 1 ? "s are" : " is") +
             " not on this device. Restore a full backup to bring them back.", true, 9000);
         } else {
@@ -3747,7 +3870,14 @@ const UI = (function () {
       App.modal.draft[name.slice(2)] = value;
     } else if (name.indexOf("ph.") === 0) {
       const pid = name.slice(3);
-      Store.getPhoto(pid).then(function (p) { if (p) { p.caption = value; Store.idbPut("photos", p); } });
+      Store.getPhoto(pid).then(function (p) {
+        if (!p) return;
+        p.caption = value;
+        Store.idbPut("photos", p);
+        // Captions live with the photo, so only a full backup carries them.
+        Store.get().settings.photos_changed_at = new Date().toISOString();
+        Store.save();
+      });
       return;
     } else if (name.indexOf("gps.") === 0 && App.modal && App.modal.type === "gps") {
       App.modal.draft = App.modal.draft || {};
