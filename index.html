@@ -1452,12 +1452,65 @@ const Store = (function () {
     });
   }
 
+  /** Two phones adding snags to the same shared inspection both issue the
+   *  same next number, so a merge can bring in a second snag 6. Give each
+   *  clashing new snag the next free number in its inspection. Snags already
+   *  on this device keep theirs: they may be on issued reports. Also raise
+   *  each inspection's last_snag_number past every snag it now has, so the
+   *  next snag made here cannot clash either. Inspections already here are
+   *  copied before changing, so a failed save leaves the state untouched.
+   *  Returns [{ from, to }] codes. */
+  function renumberSnagClashes(next, added, incoming) {
+    const isAdded = new Set(added.map(function (sn) { return sn.id; }));
+    const backupLast = new Map(incoming.inspections.map(function (i) { return [i.id, Number(i.last_snag_number) || 0]; }));
+    // Numbers already used in each inspection by snags that were here before.
+    const used = new Map();
+    next.snags.forEach(function (sn) {
+      if (isAdded.has(sn.id) || sn.snag_number == null) return;
+      if (!used.has(sn.inspection_id)) used.set(sn.inspection_id, new Set());
+      used.get(sn.inspection_id).add(sn.snag_number);
+    });
+    const byInsp = new Map();
+    added.forEach(function (sn) {
+      if (!byInsp.has(sn.inspection_id)) byInsp.set(sn.inspection_id, []);
+      byInsp.get(sn.inspection_id).push(sn);
+    });
+    const out = [];
+    next.inspections = next.inspections.map(function (insp) {
+      const fresh = byInsp.get(insp.id);
+      if (!fresh) return insp;
+      const taken = used.get(insp.id) || new Set();
+      // Start above every number either copy has used, including deleted snags.
+      let top = Math.max(Number(insp.last_snag_number) || 0, backupLast.get(insp.id) || 0);
+      taken.forEach(function (n) { top = Math.max(top, n); });
+      fresh.forEach(function (sn) { if (sn.snag_number != null) top = Math.max(top, sn.snag_number); });
+      fresh.forEach(function (sn) {
+        if (sn.snag_number == null) return;
+        if (taken.has(sn.snag_number)) {
+          top++;
+          const from = sn.code;
+          sn.snag_number = top;
+          sn.code = insp.number + "-" + String(top).padStart(3, "0");
+          // Kept, so a report or message that used the old code still finds it.
+          if (from) sn.previous_codes = (sn.previous_codes || []).concat(from);
+          out.push({ from: from || "", to: sn.code });
+        }
+        taken.add(sn.snag_number);
+      });
+      if ((Number(insp.last_snag_number) || 0) === top) return insp;
+      return Object.assign({}, insp, { last_snag_number: top });
+    });
+    return out;
+  }
+
   /** Swap in the restored state and save it. On failure the state in
    *  memory is put back, so a later save cannot write a half restore.
-   *  Returns the backup's inspections that a merge had to renumber. */
+   *  Returns the backup's inspections and snags that a merge had to
+   *  renumber: { inspections: [{ from, to }], snags: [{ from, to }] }. */
   async function commitRestore(incoming, mode) {
     let next;
     let renumbered = [];
+    let snagsRenumbered = [];
     if (mode === "replace") {
       next = incoming;
     } else {
@@ -1481,6 +1534,7 @@ const Store = (function () {
       });
       next.counters = merged;
       recodeSnags(added, next.inspections, backupNumber);
+      snagsRenumbered = renumberSnagClashes(next, added, incoming);
     }
     const prev = state;
     state = next;
@@ -1490,7 +1544,7 @@ const Store = (function () {
       state = prev;
       throw err;
     }
-    return renumbered;
+    return { inspections: renumbered, snags: snagsRenumbered };
   }
 
   /** `files` is the zip's path → { blob, crc } map from openBackup(); null
@@ -1540,7 +1594,7 @@ const Store = (function () {
     // again, so the device is left exactly as it was.
     const added = [];
     const overwrite = [];   // replace: ids already here, updated only once committed
-    let renumbered;
+    let renumbered = { inspections: [], snags: [] };
     try {
       for (const p of photos) {
         if (await idbHas("photos", p.id)) {
@@ -1573,7 +1627,7 @@ const Store = (function () {
     const have = new Set(present);
     let missing = 0;
     referenced(state).forEach(function (id) { if (!have.has(id)) missing++; });
-    return { missingPhotos: missing, renumbered: renumbered, photosLeftOut: skipped };
+    return { missingPhotos: missing, renumbered: renumbered.inspections, renumberedSnags: renumbered.snags, photosLeftOut: skipped };
   }
 
   async function usage() {
@@ -3835,6 +3889,13 @@ const UI = (function () {
           msg += " · " + rn.length + " inspection" + (rn.length > 1 ? "s" : "") + " renumbered: " +
             rn.map(function (r) { return r.from + " → " + r.to; }).join(", ");
         }
+        // Two phones added snags to the same inspection: same reasoning.
+        const rs = res.renumberedSnags || [];
+        if (rs.length) {
+          msg += " · " + rs.length + " snag" + (rs.length > 1 ? "s" : "") + " renumbered: " +
+            rs.slice(0, 5).map(function (r) { return r.from + " → " + r.to; }).join(", ") +
+            (rs.length > 5 ? " and " + (rs.length - 5) + " more (search the old code to find them)" : "");
+        }
         if (res.missingPhotos && res.photosLeftOut) {
           // backup.json without its photos folder: the data is back, the photos are not.
           UI.toast(msg + " · " + res.missingPhotos + " photo" + (res.missingPhotos > 1 ? "s are" : " is") +
@@ -3843,7 +3904,7 @@ const UI = (function () {
           UI.toast(msg + " · " + res.missingPhotos + " photo" + (res.missingPhotos > 1 ? "s are" : " is") +
             " not on this device. Restore a full backup to bring them back.", true, 9000);
         } else {
-          UI.toast(msg, false, rn.length ? 9000 : 2600);
+          UI.toast(msg, false, rn.length || rs.length ? 9000 : 2600);
         }
       } catch (err) {
         UI.toast("Restore failed: " + (err.message || err), true, 8000);
