@@ -1955,7 +1955,8 @@ const Report = (function () {
           const last = (s.history || []).slice(-1)[0];
           if (last && last.at) {
             bits.push(K.text(STATUS_LABEL[last.to] + " " + localStamp(last.at) +
-              (last.by ? " · " + last.by : ""), { size: 7.5, color: "6B7F8F" }));
+              (last.by ? " · " + last.by : "") + (last.comment ? " · " + last.comment : ""),
+              { size: 7.5, color: "6B7F8F" }));
           }
           txtCells.push(K.cell(bits.join(""), { w: 5040 }));
         }
@@ -2050,7 +2051,7 @@ const Report = (function () {
   const CSV_COLUMNS = ["Snag ID", "Project", "Area", "Inspection", "Block/Table", "Support No",
     "Location", "Category", "Risk", "Description", "Required Action", "Contractor Response",
     "Due Date", "Priority", "Status", "Inspector", "Created", "Updated", "GPS Lat", "GPS Lng",
-    "Photos", "References"];
+    "Photos", "References", "Last status note"];
 
   function buildCsv(insp, mode) {
     const project = projectOf(insp);
@@ -2061,12 +2062,13 @@ const Report = (function () {
     };
     const lines = [CSV_COLUMNS.join(",")];
     snags.forEach(function (s) {
+      const last = (s.history || []).slice(-1)[0];
       lines.push([s.code, project.name, insp.area, insp.number, s.block_table, s.support_no,
         s.location_text, s.category, s.risk, s.description, s.required_action, s.contractor_response,
         s.due_date, s.priority, STATUS_LABEL[s.status] || s.status, insp.inspector_name,
         localStamp(s.created_at, true), localStamp(s.updated_at, true),
         s.lat == null ? "" : s.lat, s.lng == null ? "" : s.lng,
-        (s.photos || []).length, refsLine(s)].map(q).join(","));
+        (s.photos || []).length, refsLine(s), last ? last.comment : ""].map(q).join(","));
     });
     return new Blob(["\ufeff" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
   }
@@ -3397,7 +3399,14 @@ const UI = (function () {
           "Verify without a close-out photo?\n\nTag a photo as After or Close-out first, or the close-out pack will show text only for this item."
         )) return;
       }
-      const comment = "";
+      // Sign-off moves get an optional note (who witnessed it, what was redone).
+      // Cancel backs out of the change; an empty note is fine.
+      let comment = "";
+      if (to === "verified" || to === "verification_failed" || to === "open") {
+        const note = prompt("Note for this change (optional) — e.g. re-torqued, witnessed by J. Smith", "");
+        if (note === null) return;
+        comment = note.trim();
+      }
       s.history = s.history || [];
       s.history.push({
         from: s.status, to: to, at: new Date().toISOString(),
