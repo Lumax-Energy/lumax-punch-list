@@ -8,9 +8,9 @@
    ========================================================================== */
 "use strict";
 
-// Keep in step with Lumax.version in index.html. A new name makes the next
-// activate step delete the old cache.
-const CACHE = "lumax-punchlist-v2.0.4";
+// Keep in step with APP_VERSION at the top of the script in index.html. A new
+// name makes the next activate step delete the old cache.
+const CACHE = "lumax-punchlist-v2.1.0";
 const PREFIX = "lumax-punchlist-";
 const SHELL = [
   "./", "./index.html", "./manifest.webmanifest",
