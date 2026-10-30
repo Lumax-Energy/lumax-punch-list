@@ -1707,10 +1707,24 @@ const Store = (function () {
     if (navigator.storage && navigator.storage.persisted) {
       try { persisted = await navigator.storage.persisted(); } catch (err) { }
     }
-    const photos = await idbAll("photos");
-    let bytes = 0;
-    photos.forEach(function (p) { bytes += (p.blob && p.blob.size) || 0; });
-    return { quota: quota, used: used, photoCount: photos.length, photoBytes: bytes, persisted: persisted };
+    const photos = await photoTotals();
+    return { quota: quota, used: used, photoCount: photos.count, photoBytes: photos.bytes, persisted: persisted };
+  }
+  // Walk the photos one at a time to add up their sizes, rather than loading
+  // every photo and its thumbnail into memory at once just to read blob.size.
+  function photoTotals() {
+    return new Promise(function (res, rej) {
+      let count = 0, bytes = 0;
+      const r = tx("photos", "readonly").openCursor();
+      r.onsuccess = function () {
+        const c = r.result;
+        if (!c) { res({ count: count, bytes: bytes }); return; }
+        count++;
+        bytes += (c.value && c.value.blob && c.value.blob.size) || 0;
+        c.continue();
+      };
+      r.onerror = function () { rej(r.error); };
+    });
   }
 
   /** Ids of every photo a snag or inspection in `s` points at. */
@@ -2982,12 +2996,11 @@ const UI = (function () {
   }
 
   /* ------------------------------------------------------------- settings -- */
-  function viewSettings(usage) {
-    const s = Store.get().settings;
+  /** The storage figures, kept in their own box so they can be filled in
+   *  when the measurement arrives without redrawing the fields below. */
+  function usageHtml(usage) {
     const used = usage && usage.quota ? usage.used / usage.quota : 0;
-    return '<div class="stack">' +
-      '<div class="card"><div class="card-h"><h2>Storage on this device</h2></div><div class="card-b">' +
-      '<div class="bar"><i class="done" style="width:' + pct(used) + '%"></i></div>' +
+    return '<div class="bar"><i class="done" style="width:' + pct(used) + '%"></i></div>' +
       '<p class="muted" style="margin:8px 0 0">' +
       (usage ? esc(fmtBytes(usage.used) + " used" + (usage.quota ? " of about " + fmtBytes(usage.quota) + " available" : "")) +
         " · " + esc(usage.photoCount) + " photos (" + esc(fmtBytes(usage.photoBytes)) + ")" : "Measuring…") + "</p>" +
@@ -2995,7 +3008,14 @@ const UI = (function () {
         ? '<p class="muted" style="margin:6px 0 0">Storage is persistent: the browser will not clear it on its own.</p>'
         : usage && usage.persisted === false
           ? '<p class="muted" style="margin:6px 0 0"><b>Storage is not persistent</b> — the browser may clear it when space runs low. Keep your backups current.</p>'
-          : "") +
+          : "");
+  }
+
+  function viewSettings(usage) {
+    const s = Store.get().settings;
+    return '<div class="stack">' +
+      '<div class="card"><div class="card-h"><h2>Storage on this device</h2></div><div class="card-b">' +
+      '<div id="usageBox">' + usageHtml(usage) + "</div>" +
       '<div class="banner warn" style="margin-top:10px"><span>!</span><span><b>Chrome can clear this</b>' +
       "Clearing site data, or uninstalling the app, deletes every inspection on this device. Export a backup after each site visit.</span></div>" +
       "</div></div>" +
@@ -3050,6 +3070,11 @@ const UI = (function () {
   let usageCache = null;
 
   async function render() {
+    const view = document.getElementById("view");
+    // A redraw can land mid-typing (a photo finished processing). Save the
+    // last keystrokes first so the new field is not drawn from older text.
+    const typing = focusedField(view);
+    if (typing) flushField();
     const insp = currentInspection();
     let html = "";
     if (App.route === "inspection" && insp) {
@@ -3063,15 +3088,42 @@ const UI = (function () {
       html = viewSettings(usageCache);
       Store.usage().then(function (u) {
         usageCache = u;
-        if (App.route === "settings") { document.getElementById("view").innerHTML = viewSettings(u); }
+        // Only the figures change, so leave the fields (and anyone typing) alone.
+        const box = document.getElementById("usageBox");
+        if (App.route === "settings" && box) box.innerHTML = usageHtml(u);
       });
     } else {
       App.route = "home";
       html = viewHome();
     }
-    document.getElementById("view").innerHTML = html;
+    view.innerHTML = html;
     chrome();
     hydrate();
+    refocusField(view, typing);
+  }
+
+  /* ------------------------------------------------ typing across redraws -- */
+  // Typed text reaches state 320 ms after the last key. The actions code
+  // registers its flush here so a redraw can save that text first.
+  let flushField = function () { };
+  function setFieldFlush(fn) { flushField = fn; }
+
+  /** The entry field being typed in inside root, with its cursor, or null. */
+  function focusedField(root) {
+    const a = document.activeElement;
+    if (!root || !a || !root.contains(a) || !a.hasAttribute("data-f") || a.tagName === "BUTTON") return null;
+    const f = { name: a.getAttribute("data-f"), start: null, end: null };
+    // Some input types (number, email) throw on selectionStart.
+    try { f.start = a.selectionStart; f.end = a.selectionEnd; } catch (e) { }
+    return f;
+  }
+  /** Put the keyboard back in the redrawn field with the same name. */
+  function refocusField(root, f) {
+    if (!f) return;
+    const el = root.querySelector('[data-f="' + CSS.escape(f.name) + '"]');
+    if (!el) return;
+    el.focus();
+    if (f.start != null) { try { el.setSelectionRange(f.start, f.end); } catch (e) { } }
   }
 
   /** Fill in photo thumbnails after paint — keeps first render instant. */
@@ -3090,9 +3142,23 @@ const UI = (function () {
   }
 
   /* ---------------------------------------------------------------- modal -- */
-  function openModal(html) {
-    document.getElementById("modal").innerHTML =
-      '<div class="scrim" data-a="scrim"><div class="sheet" role="dialog" aria-modal="true">' + html + "</div></div>";
+  /** key names the sheet (e.g. "snag:<id>"). Redrawing the sheet that is
+   *  already open keeps its scroll position and the field being typed in, so
+   *  a status tap near the bottom or a photo finishing does not jump to the top.
+   *  The caller saves pending typing before building html (snagSheet does). */
+  function openModal(html, key) {
+    const modal = document.getElementById("modal");
+    const old = modal.querySelector(".sheet");
+    const same = !!(key && old && old.getAttribute("data-key") === key);
+    const scroll = same ? old.scrollTop : 0;
+    const typing = same ? focusedField(old) : null;
+    modal.innerHTML = '<div class="scrim" data-a="scrim"><div class="sheet" role="dialog" aria-modal="true"' +
+      (key ? ' data-key="' + esc(key) + '"' : "") + ">" + html + "</div></div>";
+    if (same) {
+      const sheet = modal.querySelector(".sheet");
+      sheet.scrollTop = scroll;
+      refocusField(sheet, typing);
+    }
     hydrate();
   }
   function closeModal() {
@@ -3108,7 +3174,7 @@ const UI = (function () {
 
   return {
     toast: toast, hideToast: hideToast, render: render, hydrate: hydrate, chrome: chrome,
-    openModal: openModal, closeModal: closeModal, sheetHead: sheetHead,
+    openModal: openModal, closeModal: closeModal, sheetHead: sheetHead, setFieldFlush: setFieldFlush,
     field: field, input: input, dateField: dateField, textarea: textarea, select: select, seg: seg,
     riskTag: riskTag, statusTag: statusTag, snagRow: snagRow, bar: bar,
     currentInspection: currentInspection,
@@ -3188,6 +3254,9 @@ const UI = (function () {
   function snagSheet(id) {
     const s = snagById(id);
     if (!s) return;
+    // Save what was just typed while App.modal still names the sheet it was
+    // typed in; the rebuilt fields are drawn from state.
+    flushPendingField();
     App.modal = { type: "snag", id: id };
     App.snagId = id;
     const st = Store.get();
@@ -3284,7 +3353,7 @@ const UI = (function () {
       '<button class="btn btn-d" data-a="del-snag">Delete snag</button>' +
       "</div>" +
       '<p class="muted" style="margin-top:10px">' + esc(s.code) + "</p>" +
-      "</div>");
+      "</div>", "snag:" + s.id);
 
     // Show each photo's kind label, or say so when the photo is not stored here.
     (s.photos || []).forEach(function (pid) {
@@ -3447,7 +3516,8 @@ const UI = (function () {
     s.updated_at = new Date().toISOString();
     Store.save();
     App.snagId = s.id;
-    App.modal = { type: "snag", id: s.id };
+    // snagSheet sets App.modal itself, after saving any pending typing to the
+    // sheet it was typed in (setting it here first would send it to the snag).
     snagSheet(s.id);
   }
   function gpsSheet(s, status, trying) {
@@ -4079,6 +4149,7 @@ const UI = (function () {
   };
 
   /* ------------------------------------------------------------ binding -- */
+  UI.setFieldFlush(flushPendingField);
   function flushPendingField() {
     clearTimeout(typeTimer);
     const active = document.activeElement;
