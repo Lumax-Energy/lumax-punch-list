@@ -2250,9 +2250,23 @@ const Report = (function () {
     "Due Date", "Priority", "Status", "Inspector", "Created", "Updated", "GPS Lat", "GPS Lng",
     "Photos", "References", "Last status note", "Former Snag ID"];
 
-  function buildCsv(insp, mode) {
+  /** The register's rows as raw values, one array per snag in CSV_COLUMNS
+   *  order. The CSV and the .xlsx both write these, so they always match. */
+  function registerRows(insp, mode) {
     const project = projectOf(insp);
-    const snags = filterSnags(snagsOf(insp.id), mode);
+    return filterSnags(snagsOf(insp.id), mode).map(function (s) {
+      const last = (s.history || []).slice(-1)[0];
+      return [s.code, project.name, insp.area, insp.number, s.block_table, s.support_no,
+        s.location_text, s.category, s.risk, s.description, s.required_action, s.contractor_response,
+        s.due_date, s.priority, STATUS_LABEL[s.status] || s.status, insp.inspector_name,
+        localStamp(s.created_at, true), localStamp(s.updated_at, true),
+        s.lat == null ? "" : s.lat, s.lng == null ? "" : s.lng,
+        (s.photos || []).length, refsLine(s), last ? last.comment : "",
+        (s.previous_codes || []).join("; ")];
+    });
+  }
+
+  function buildCsv(insp, mode) {
     const q = function (v) {
       let s = v == null ? "" : String(v);
       // The register goes to clients and contractors, and Excel runs a cell
@@ -2263,17 +2277,115 @@ const Report = (function () {
       return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
     const lines = [CSV_COLUMNS.join(",")];
-    snags.forEach(function (s) {
-      const last = (s.history || []).slice(-1)[0];
-      lines.push([s.code, project.name, insp.area, insp.number, s.block_table, s.support_no,
-        s.location_text, s.category, s.risk, s.description, s.required_action, s.contractor_response,
-        s.due_date, s.priority, STATUS_LABEL[s.status] || s.status, insp.inspector_name,
-        localStamp(s.created_at, true), localStamp(s.updated_at, true),
-        s.lat == null ? "" : s.lat, s.lng == null ? "" : s.lng,
-        (s.photos || []).length, refsLine(s), last ? last.comment : "",
-        (s.previous_codes || []).join("; ")].map(q).join(","));
-    });
+    registerRows(insp, mode).forEach(function (row) { lines.push(row.map(q).join(",")); });
     return new Blob(["\ufeff" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
+  }
+
+  /* ------------------------------------------------------------ xlsx ---
+     Excel reads a CSV cell by cell and "helps": 4-5 becomes a date, 007
+     becomes 7, long numbers go to 1E+15. In an .xlsx a cell says what it is,
+     so every text value goes in as an inline string and Excel keeps it
+     exactly. Only real numbers (GPS, photo count) are written as numbers.
+     Built with the same store-only zip as the Word file. */
+  const XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+  const XLSX_WIDTHS = [16, 22, 16, 16, 12, 11, 22, 16, 6, 48, 40, 36,
+    11, 9, 12, 18, 17, 17, 11, 11, 7, 30, 36, 18];
+  // Long text columns wrap, so a description is readable without widening it.
+  const XLSX_WRAP = [6, 9, 10, 11, 21, 22];
+
+  function xlsxColumn(i) {
+    let s = "";
+    for (i += 1; i > 0; i = Math.floor((i - 1) / 26)) s = String.fromCharCode(65 + (i - 1) % 26) + s;
+    return s;
+  }
+
+  function xlsxText(v) {
+    return String(v)
+      // Control characters are not allowed in XML at all; Excel uses \n alone.
+      .replace(/\r\n?/g, "\n")
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\ufffe\uffff]/g, "")
+      // Excel reads "_x0041_" in a string as an escaped "A": escape the
+      // underscore so such text comes back as typed.
+      .replace(/_(x[0-9A-Fa-f]{4}_)/g, "_x005F_$1")
+      // An Excel cell holds at most 32,767 characters; more and it will not open.
+      .slice(0, 32767)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  function xlsxCell(ref, v, style) {
+    if (typeof v === "number" && isFinite(v)) return '<c r="' + ref + '" s="' + style + '"><v>' + v + "</v></c>";
+    if (v == null || v === "") return "";
+    // Inline strings are never formulas, so "=SUM(A1)" needs no apostrophe here.
+    return '<c r="' + ref + '" s="' + style + '" t="inlineStr"><is><t xml:space="preserve">' + xlsxText(v) + "</t></is></c>";
+  }
+
+  function buildXlsx(insp, mode) {
+    const rows = registerRows(insp, mode);
+    const last = xlsxColumn(CSV_COLUMNS.length - 1) + (rows.length + 1);
+    const NS = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"';
+    const REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const head = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
+
+    const sheetRows = ['<row r="1">' + CSV_COLUMNS.map(function (h, c) {
+      return xlsxCell(xlsxColumn(c) + "1", h, 1);
+    }).join("") + "</row>"];
+    rows.forEach(function (row, r) {
+      sheetRows.push('<row r="' + (r + 2) + '">' + row.map(function (v, c) {
+        return xlsxCell(xlsxColumn(c) + (r + 2), v, XLSX_WRAP.indexOf(c) >= 0 ? 3 : 2);
+      }).join("") + "</row>");
+    });
+
+    const sheet = head + "<worksheet " + NS + ">" +
+      '<sheetViews><sheetView workbookViewId="0">' +
+      '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>' +
+      '<selection pane="bottomLeft" activeCell="A2" sqref="A2"/></sheetView></sheetViews>' +
+      '<sheetFormatPr defaultRowHeight="15"/><cols>' +
+      XLSX_WIDTHS.map(function (w, c) {
+        return '<col min="' + (c + 1) + '" max="' + (c + 1) + '" width="' + w + '" customWidth="1"/>';
+      }).join("") + "</cols>" +
+      "<sheetData>" + sheetRows.join("") + "</sheetData>" +
+      '<autoFilter ref="A1:' + last + '"/></worksheet>';
+
+    const styles = head + "<styleSheet " + NS + ">" +
+      '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font>' +
+      '<font><b/><sz val="11"/><name val="Calibri"/></font></fonts>' +
+      '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>' +
+      '<fill><patternFill patternType="solid"><fgColor rgb="FFE8EDF2"/><bgColor indexed="64"/></patternFill></fill></fills>' +
+      '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>' +
+      '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
+      '<cellXfs count="4"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>' +
+      '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>' +
+      '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top"/></xf>' +
+      '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>' +
+      '</cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>';
+
+    const blob = K.zip([
+      { name: "[Content_Types].xml", data: head +
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+        '<Default Extension="xml" ContentType="application/xml"/>' +
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' +
+        "</Types>" },
+      { name: "_rels/.rels", data: head +
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+        '<Relationship Id="rId1" Type="' + REL + '/officeDocument" Target="xl/workbook.xml"/></Relationships>' },
+      { name: "xl/workbook.xml", data: head +
+        "<workbook " + NS + ' xmlns:r="' + REL + '"><bookViews><workbookView/></bookViews>' +
+        '<sheets><sheet name="Register" sheetId="1" r:id="rId1"/></sheets>' +
+        // Excel looks for the filter range under this hidden name.
+        '<definedNames><definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">' +
+        "Register!$A$1:$" + xlsxColumn(CSV_COLUMNS.length - 1) + "$" + (rows.length + 1) + "</definedName></definedNames>" +
+        "</workbook>" },
+      { name: "xl/_rels/workbook.xml.rels", data: head +
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+        '<Relationship Id="rId1" Type="' + REL + '/worksheet" Target="worksheets/sheet1.xml"/>' +
+        '<Relationship Id="rId2" Type="' + REL + '/styles" Target="styles.xml"/></Relationships>' },
+      { name: "xl/worksheets/sheet1.xml", data: sheet },
+      { name: "xl/styles.xml", data: styles },
+    ]);
+    return new Blob([blob], { type: XLSX_MIME });
   }
 
   /* -------------------------------------------------------- pre-flight --- */
@@ -2436,7 +2548,7 @@ const Report = (function () {
   }
 
   return {
-    buildDocx: buildDocx, buildCsv: buildCsv, preflight: preflight, refreshEvidence: refreshEvidence,
+    buildDocx: buildDocx, buildCsv: buildCsv, buildXlsx: buildXlsx, preflight: preflight, refreshEvidence: refreshEvidence,
     refreshPhotos: refreshPhotos, photoMissing: photoMissing, keptPhotos: keptPhotos,
     renderMap: renderMap, fileBase: fileBase, filterSnags: filterSnags,
   };
@@ -2455,6 +2567,7 @@ function saveBlob(blob, filename) {
 const SHARE_MIME = {
   docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   csv: "text/csv", zip: "application/zip", json: "application/json",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 };
 function fileFor(blob, filename) {
   const ext = filename.split(".").pop().toLowerCase();
@@ -2951,7 +3064,9 @@ const UI = (function () {
         'data-a="export" data-v="open"', "x.docx", "open items report") +
       withShare('<button class="btn" data-a="export" data-v="closeout">Close-out pack — ' + esc(t.done) + " verified</button>",
         'data-a="export" data-v="closeout"', "x.docx", "close-out pack") +
-      withShare('<button class="btn" data-a="export-csv">CSV register (Excel)</button>',
+      withShare('<button class="btn" data-a="export-xlsx">Excel register (.xlsx)</button>',
+        'data-a="export-xlsx"', "x.xlsx", "Excel register") +
+      withShare('<button class="btn" data-a="export-csv">CSV register</button>',
         'data-a="export-csv"', "x.csv", "CSV register") +
       '<p class="muted">Files land in your Downloads folder' +
       (canShareFile("x.docx") ? "; Share… sends one straight to mail, WhatsApp or Drive" : "") + ". Filename: " +
@@ -4087,6 +4202,13 @@ const UI = (function () {
       if (!el.hasAttribute("data-share")) { saveBlob(blob, name); UI.toast("CSV downloaded"); return; }
       const how = await shareBlob(blob, name);
       if (how !== "cancelled") UI.toast(how === "shared" ? "CSV shared" : "CSV downloaded");
+    },
+    "export-xlsx": async function (el) {
+      const i = insp();
+      const blob = Report.buildXlsx(i, "full"), name = Report.fileBase(i, "full", i.rev || 0) + ".xlsx";
+      if (!el.hasAttribute("data-share")) { saveBlob(blob, name); UI.toast("Excel register downloaded"); return; }
+      const how = await shareBlob(blob, name);
+      if (how !== "cancelled") UI.toast(how === "shared" ? "Excel register shared" : "Excel register downloaded");
     },
     "new-revision": function () {
       const i = insp(), st = Store.get();
