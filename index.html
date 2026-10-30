@@ -97,6 +97,7 @@ main{flex:1;padding:12px 12px 96px;max-width:1500px;width:100%;margin:0 auto}
 .btn[disabled]{opacity:.45;pointer-events:none}
 .btn-row{display:flex;gap:8px;flex-wrap:wrap}
 .btn-row>.btn{flex:1 1 auto}
+.btn-row>.btn-share{flex:0 0 auto}
 .fab{
   position:fixed;right:14px;bottom:calc(env(safe-area-inset-bottom,0px) + 74px);z-index:35;
   height:58px;padding:0 20px;border-radius:29px;background:var(--steel);color:#fff;
@@ -163,8 +164,9 @@ textarea.inp{min-height:82px;resize:vertical;line-height:1.4}
 }
 .rail.r-HR .num{background:var(--hr)} .rail.r-LR .num{background:var(--lr)}
 .rail.done .num{background:var(--ok)}
-.rail .desc{font-size:14px;line-height:1.35;color:var(--ink);word-break:break-word}
-.rail .meta{font-size:11.5px;color:var(--ink-3);margin-top:4px;font-family:var(--mono)}
+.rail .desc{display:block;font-size:14px;line-height:1.35;color:var(--ink);word-break:break-word}
+.rail .meta{display:block;font-size:11.5px;color:var(--ink-3);margin-top:4px;font-family:var(--mono)}
+.rail .meta .late{color:var(--hr);font-weight:700}
 .rail .thumb{
   float:right;width:58px;height:58px;object-fit:cover;border-radius:7px;margin:0 0 6px 10px;
   border:1px solid var(--line);background:var(--band);
@@ -295,7 +297,8 @@ textarea.inp{min-height:82px;resize:vertical;line-height:1.4}
   main{padding:16px 20px 40px}
   .tabs{
     position:static;border-top:0;border:1px solid var(--line);border-radius:var(--r);
-    background:var(--surface);box-shadow:var(--shadow);margin-bottom:14px;overflow:hidden;
+    background:var(--surface);box-shadow:var(--shadow);overflow:hidden;
+    width:calc(100% - 40px);max-width:1460px;margin:16px auto 0;
   }
   .tabs button{padding:11px 8px;font-size:12px;border-top:0;border-bottom:3px solid transparent}
   .tabs button.on{border-bottom-color:var(--steel);background:#F4F8FB}
@@ -337,9 +340,9 @@ textarea.inp{min-height:82px;resize:vertical;line-height:1.4}
     <button class="iconbtn" id="btnSun" title="High-contrast mode for sunlight">Sun</button>
     <button class="iconbtn" id="btnHome">Home</button>
   </header>
+  <div id="tabs"></div>
   <main id="view"><div class="empty">Loading…</div></main>
 </div>
-<div id="tabs"></div>
 <div id="fab"></div>
 <div id="modal"></div>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
@@ -372,6 +375,10 @@ const STATUSES = [
   { id: "closed", label: "Closed", short: "Closed" },
 ];
 const DONE = ["verified", "closed"];
+// Once a snag is marked fixed (or later), a new photo is evidence of the fix,
+// not of the defect, so it is saved as a close-out photo by default.
+// Not verification_failed: a photo taken then shows why it failed.
+const CLOSEOUT_STATUSES = ["fixed", "pending_verification", "verified", "closed"];
 const STATUS_LABEL = {};
 STATUSES.forEach(function (s) { STATUS_LABEL[s.id] = s.label; });
 const STATUS_HEX = {
@@ -479,6 +486,10 @@ const DEFAULT_SETTINGS = {
   legend: "Hot Dip Galvanised (HDG); Spring Washer (SW); Flat Washer (FW); Large Washer (LW); Corrugated Washer (CW); Threaded Rod (TR); Installation Manual (IM)",
   photo_max_edge: 1600,
   photo_quality: 0.82,
+  last_backup_at: "",       // set by each successful backup; drives the home reminder
+  last_backup_full: false,
+  last_full_backup_at: "",  // full backups only: the photos' own reminder clock
+  photos_changed_at: "",    // a photo was added, re-tagged or captioned
 };
 /* ============================================================================
    docx.js — a small, self-contained Word (.docx) writer.
@@ -693,7 +704,9 @@ const DocxKit = (function () {
     const name = "image" + this.media.length + "." + (img.ext === "png" ? "png" : "jpeg");
     this.media.push({ name: name, data: img.bytes, rid: rid });
 
-    const ratio = img.h / img.w;
+    // A photo restored from a damaged backup can lack its size. NaN in the
+    // XML makes Word refuse the whole file, so fall back to 4:3.
+    const ratio = img.w > 0 && img.h > 0 && isFinite(img.h / img.w) ? img.h / img.w : 0.75;
     let wmm = maxWmm;
     let hmm = wmm * ratio;
     if (maxHmm && hmm > maxHmm) { hmm = maxHmm; wmm = hmm / ratio; }
@@ -946,7 +959,12 @@ const Store = (function () {
     const out = Object.assign(blank(), s);
     out.settings = Object.assign({}, DEFAULT_SETTINGS, isObj(s.settings) ? s.settings : {});
     asText(out.settings, ["company_name", "report_title", "company_footer", "inspection_prefix",
-      "inspector_name", "risk_legend", "legend"]);
+      "inspector_name", "risk_legend", "legend", "last_backup_at", "last_full_backup_at", "photos_changed_at"]);
+    out.settings.last_backup_full = out.settings.last_backup_full === true;
+    // Data saved before the photo clock existed: its last backup, if full, is it.
+    if (!out.settings.last_full_backup_at && out.settings.last_backup_full) {
+      out.settings.last_full_backup_at = out.settings.last_backup_at || "";
+    }
     out.settings.photo_max_edge = asNum(out.settings.photo_max_edge) || DEFAULT_SETTINGS.photo_max_edge;
     out.settings.photo_quality = asNum(out.settings.photo_quality) || DEFAULT_SETTINGS.photo_quality;
     ["projects", "inspections", "snags", "templates", "remarks", "revisions"].forEach(function (k) {
@@ -962,6 +980,8 @@ const Store = (function () {
       asText(sn, ["id", "inspection_id", "code", "block_table", "support_no", "location_text", "category",
         "description", "required_action", "contractor_response", "due_date", "priority"]);
       sn.photos = asIds(sn.photos);
+      // Codes this snag had before a merge renumbered its inspection.
+      sn.previous_codes = asIds(sn.previous_codes);
       sn.references = Array.isArray(sn.references) ? sn.references.filter(isObj) : [];
       sn.references.forEach(function (r) { asText(r, ["ref_type", "document", "detail"]); });
       sn.history = Array.isArray(sn.history) ? sn.history.filter(isObj) : [];
@@ -982,6 +1002,7 @@ const Store = (function () {
         "inspector_name", "client_qc_name", "status", "general_remarks", "technical_notes",
         "site_photo_id", "site_plan_id"]);
       i.photos = asIds(i.photos);
+      i.previous_numbers = asIds(i.previous_numbers);
       if (i.general_remarks == null) i.general_remarks = "";
       if (i.technical_notes == null) i.technical_notes = "";
       i.rev = asNum(i.rev) || 0;
@@ -1153,6 +1174,8 @@ const Store = (function () {
       created_at: new Date().toISOString(),
     };
     await idbPut("photos", rec);
+    // Only a full backup holds this photo; the caller's save() stores this.
+    state.settings.photos_changed_at = rec.created_at;
     return rec;
   }
 
@@ -1314,9 +1337,19 @@ const Store = (function () {
     return out;
   }
 
+  /** Returns { blob, at }. The data is copied first and `at` is that
+   *  moment: reading every photo can take a while, and anything edited
+   *  meanwhile is not in the file, so it must not count as backed up. */
   async function backup(withPhotos) {
-    const payload = { format: "lumax-punchlist-backup", version: 1, exported_at: new Date().toISOString(), state: state, photos: [] };
-    if (!withPhotos) return new Blob([JSON.stringify(payload)], { type: "application/json" });
+    const at = new Date().toISOString();
+    const copy = JSON.parse(JSON.stringify(state));
+    // A device restored from this file has been backed up at `at`, so the
+    // file carries this backup's own clocks, not the previous backup's.
+    copy.settings.last_backup_at = at;
+    copy.settings.last_backup_full = !!withPhotos;
+    if (withPhotos) copy.settings.last_full_backup_at = at;
+    const payload = { format: "lumax-punchlist-backup", version: 1, exported_at: at, state: copy, photos: [] };
+    if (!withPhotos) return { blob: new Blob([JSON.stringify(payload)], { type: "application/json" }), at: at };
     const files = [];
     const names = new Set();
     const all = await idbAll("photos");
@@ -1338,12 +1371,12 @@ const Store = (function () {
       payload.photos.push(meta);
     }
     files.unshift({ name: "backup.json", data: new TextEncoder().encode(JSON.stringify(payload)) });
-    return zipBlob(files);
+    return { blob: await zipBlob(files), at: at };
   }
 
   /** Read a backup file: a full backup .zip, or a .json (a data-only
    *  backup, or a full backup from before photos moved into a zip).
-   *  Returns { json, files } where files maps zip paths to Blobs. */
+   *  Returns { json, files } where files maps zip paths to { blob, crc }. */
   async function openBackup(file) {
     const head = await toBytes(file.slice(0, 4));
     const isZip = head && head.length === 4 && head[0] === 0x50 && head[1] === 0x4b && head[2] === 3 && head[3] === 4;
@@ -1353,19 +1386,17 @@ const Store = (function () {
     if (!main) throw new Error("That .zip is not a Lumax Punch List backup.");
     const bytes = await toBytes(main.blob);
     if (DocxKit.crc32(bytes) !== main.crc) throw new Error(ZIP_DAMAGED);
-    const files = new Map();
-    entries.forEach(function (e, name) { files.set(name, e.blob); });
-    return { json: JSON.parse(new TextDecoder().decode(bytes)), files: files };
+    // Each photo keeps its CRC, so restore() can check its bytes too.
+    return { json: JSON.parse(new TextDecoder().decode(bytes)), files: entries };
   }
 
   /** Each phone counts inspection numbers on its own, so a merge can bring
    *  in a different inspection under a number already used here. Give the
-   *  backup's copy the next free number and re-code its snags. Inspections
-   *  already on this device never change: their numbers may be on issued
-   *  reports. Returns [{ from, to }]. */
+   *  backup's copy the next free number; commitRestore re-codes its snags.
+   *  Inspections already on this device never change: their numbers may be
+   *  on issued reports. Returns [{ from, to }]. */
   function renumberClashes(incoming, counters) {
     const localInsp = new Set(state.inspections.map(function (i) { return i.id; }));
-    const localSnag = new Set(state.snags.map(function (s) { return s.id; }));
     const claimed = new Set(state.inspections.map(function (i) { return i.number; }));
     // Every number in either copy, so a new number never lands on one the
     // backup itself uses further down the list.
@@ -1390,16 +1421,32 @@ const Store = (function () {
       taken.add(to); claimed.add(to);
       const from = insp.number;
       insp.number = to;
-      // Snag codes start with the inspection number. snag_number stays, so
-      // only the front of each code moves.
-      incoming.snags.forEach(function (sn) {
-        if (sn.inspection_id !== insp.id || localSnag.has(sn.id)) return;
-        if (sn.snag_number != null) sn.code = to + "-" + String(sn.snag_number).padStart(3, "0");
-        else if (sn.code && sn.code.indexOf(from + "-") === 0) sn.code = to + sn.code.slice(from.length);
-      });
+      // Kept on the record, so a report already issued under the old number
+      // can still be traced to this inspection after the toast has gone.
+      insp.previous_numbers = (insp.previous_numbers || []).concat(from);
       out.push({ from: from, to: to });
     });
     return out;
+  }
+
+  /** Snag codes start with the inspection number. A new snag from a backup
+   *  can belong to an inspection numbered differently here: renumbered in
+   *  this merge, or in an earlier merge from the same phone, which still
+   *  uses the old number. Move the front of its code to this device's
+   *  number, so no two snags here share a code. */
+  function recodeSnags(snags, inspections, backupNumber) {
+    const numberOf = new Map(inspections.map(function (i) { return [i.id, i.number]; }));
+    snags.forEach(function (sn) {
+      const to = numberOf.get(sn.inspection_id);
+      if (!to || (sn.code && sn.code.indexOf(to + "-") === 0)) return;
+      const from = backupNumber.get(sn.inspection_id);
+      let code = sn.code;
+      if (sn.snag_number != null) code = to + "-" + String(sn.snag_number).padStart(3, "0");
+      else if (from && sn.code && sn.code.indexOf(from + "-") === 0) code = to + sn.code.slice(from.length);
+      if (code === sn.code) return;
+      if (sn.code) sn.previous_codes = (sn.previous_codes || []).concat(sn.code);
+      sn.code = code;
+    });
   }
 
   /** Swap in the restored state and save it. On failure the state in
@@ -1419,12 +1466,18 @@ const Store = (function () {
       Object.keys(localC).concat(Object.keys(inC)).forEach(function (y) {
         merged[y] = Math.max(Number(localC[y]) || 0, Number(inC[y]) || 0);
       });
+      // The number each inspection has in the backup, before any renumbering.
+      const backupNumber = new Map(incoming.inspections.map(function (i) { return [i.id, i.number]; }));
       renumbered = renumberClashes(incoming, merged);
+      const added = [];
       ["projects", "inspections", "snags", "revisions", "templates", "remarks"].forEach(function (k) {
         const have = new Set(state[k].map(function (x) { return x.id; }));
-        next[k] = state[k].concat(incoming[k].filter(function (x) { return !have.has(x.id); }));
+        const fresh = incoming[k].filter(function (x) { return !have.has(x.id); });
+        if (k === "snags") added.push.apply(added, fresh);
+        next[k] = state[k].concat(fresh);
       });
       next.counters = merged;
+      recodeSnags(added, next.inspections, backupNumber);
     }
     const prev = state;
     state = next;
@@ -1437,8 +1490,8 @@ const Store = (function () {
     return renumbered;
   }
 
-  /** `files` is the zip's path → Blob map from openBackup(); null for a
-   *  .json backup, whose photos (if any) are base64 inside it. */
+  /** `files` is the zip's path → { blob, crc } map from openBackup(); null
+   *  for a .json backup, whose photos (if any) are base64 inside it. */
   async function restore(json, mode, files) {
     if (!json || json.format !== "lumax-punchlist-backup") {
       throw new Error("That file is not a Lumax Punch List backup.");
@@ -1448,26 +1501,37 @@ const Store = (function () {
     // fails cleanly instead of half way through.
     // Photo ids end up in attributes and the thumb in an img src, so they
     // get the same type checks as the state.
-    const photos = (Array.isArray(json.photos) ? json.photos : []).filter(function (p) {
-      return isObj(p) && p.id != null && p.id !== "";
-    }).map(function (p) {
+    // A size must be a positive number: the Word export divides by it.
+    const size = function (v) { const n = asNum(v); return n > 0 ? n : null; };
+    const photos = [];
+    let skipped = 0;
+    for (const p of (Array.isArray(json.photos) ? json.photos : [])) {
+      if (!isObj(p) || p.id == null || p.id === "") continue;
       let blob;
       if (p.file != null && p.file !== "") {
-        // Zip backup: the photo is a slice of the file, stored as it is.
-        const part = files && files.get(String(p.file));
+        // backup.json on its own: the phone or computer unzipped the backup
+        // and kept only the folder. Restore the data; the photos show up as
+        // missing rather than blocking everything else.
+        if (!files) { skipped++; continue; }
+        const part = files.get(String(p.file));
         if (!part) throw new Error("The backup is missing the photo file " + p.file + ".");
-        blob = part.slice(0, part.size, "image/jpeg");
+        // Read and check each photo now, one at a time, and keep a copy of
+        // its bytes: damaged bytes never replace a good photo here, and the
+        // save does not depend on the picked file still being readable.
+        const bytes = await toBytes(part.blob);
+        if (!bytes || DocxKit.crc32(bytes) !== part.crc) throw new Error(ZIP_DAMAGED);
+        blob = new Blob([bytes], { type: "image/jpeg" });
       } else {
         blob = b64ToBlob(p.data, "image/jpeg");
       }
-      return {
+      photos.push({
         id: String(p.id), blob: blob,
         thumb: typeof p.thumb === "string" && p.thumb.indexOf("data:image/") === 0 ? p.thumb : null,
-        w: asNum(p.w), h: asNum(p.h),
+        w: size(p.w), h: size(p.h),
         kind: p.kind === "after" || p.kind === "closeout" ? p.kind : "before",
         caption: p.caption == null ? "" : String(p.caption), created_at: p.created_at == null ? "" : String(p.created_at),
-      };
-    });
+      });
+    }
     // Add the backup's new photos before deleting or changing any. If anything
     // fails before the restored state is saved, the ones added are removed
     // again, so the device is left exactly as it was.
@@ -1506,7 +1570,7 @@ const Store = (function () {
     const have = new Set(present);
     let missing = 0;
     referenced(state).forEach(function (id) { if (!have.has(id)) missing++; });
-    return { missingPhotos: missing, renumbered: renumbered };
+    return { missingPhotos: missing, renumbered: renumbered, photosLeftOut: skipped };
   }
 
   async function usage() {
@@ -1514,10 +1578,15 @@ const Store = (function () {
     if (navigator.storage && navigator.storage.estimate) {
       try { const e = await navigator.storage.estimate(); quota = e.quota || 0; used = e.usage || 0; } catch (err) { }
     }
+    // null = this browser cannot say, which the screen treats as unknown.
+    let persisted = null;
+    if (navigator.storage && navigator.storage.persisted) {
+      try { persisted = await navigator.storage.persisted(); } catch (err) { }
+    }
     const photos = await idbAll("photos");
     let bytes = 0;
     photos.forEach(function (p) { bytes += (p.blob && p.blob.size) || 0; });
-    return { quota: quota, used: used, photoCount: photos.length, photoBytes: bytes };
+    return { quota: quota, used: used, photoCount: photos.length, photoBytes: bytes, persisted: persisted };
   }
 
   /** Ids of every photo a snag or inspection in `s` points at. */
@@ -1687,9 +1756,15 @@ function inspectionsOf(projectId) {
     .filter(function (i) { return i.project_id === projectId; })
     .sort(function (a, b) { return (b.inspection_date || "").localeCompare(a.inspection_date || ""); });
 }
+/** Past its due date and not yet verified/closed. Due dates are local
+ *  YYYY-MM-DD strings, so a plain string compare against today() works. */
+function isOverdue(s) {
+  return !!s.due_date && s.due_date < today() && DONE.indexOf(s.status) < 0;
+}
 function tally(snags) {
-  const t = { total: snags.length, open: 0, hrOpen: 0, done: 0, prog: 0 };
+  const t = { total: snags.length, open: 0, hrOpen: 0, done: 0, prog: 0, overdue: 0 };
   snags.forEach(function (s) {
+    if (isOverdue(s)) t.overdue++;
     if (DONE.indexOf(s.status) >= 0) t.done++;
     else if (s.status === "open") { t.open++; if (s.risk === "HR") t.hrOpen++; }
     else { t.prog++; if (s.risk === "HR") t.hrOpen++; }
@@ -1810,6 +1885,9 @@ const Report = (function () {
       K.text("Revision: " + revNumber + "        Date: " + (insp.inspection_date || ""), { size: 10, align: "right", spaceAfter: 1 }),
       insp.next_inspection_date ? K.text("Next revision: " + insp.next_inspection_date, { size: 10, align: "right", spaceAfter: 1 }) : "",
       K.text("Inspection No: " + insp.number, { size: 10, bold: true, align: "right" }),
+      // A merge renumbered it: the old number may be on reports already sent.
+      (insp.previous_numbers || []).length
+        ? K.text("Formerly: " + insp.previous_numbers.join(", "), { size: 9, align: "right" }) : "",
     ].join("");
     doc.add(K.table([3400, 6680], [K.row([
       K.cell(logo ? K.para(logo) : K.text(set.company_name || "", { size: 12, bold: true, color: NAVY }),
@@ -1861,8 +1939,10 @@ const Report = (function () {
       " high risk), " + t.done + " verified/closed.", { size: 10, bold: true }));
 
     /* snag summary table ------------------------------------------------ */
-    const head = ["Snag ID", "Block/Table", "Impact", "Description", "Status"];
-    const cw = [1500, 1500, 900, 4680, 1500];
+    // Widths must add up to W. Due takes its 1100 from Block/Table, Impact
+    // and Description; a YYYY-MM-DD date fits on one line at 9 pt.
+    const head = ["Snag ID", "Block/Table", "Impact", "Description", "Due", "Status"];
+    const cw = [1500, 1300, 800, 3880, 1100, 1500];
     const rows = [K.row(head.map(function (h, i) {
       return K.cell(K.text(h, { size: 9, bold: true, color: "FFFFFF" }), { w: cw[i], bg: NAVY });
     }), { header: true })];
@@ -1873,12 +1953,13 @@ const Report = (function () {
         K.cell(K.text(s.block_table || "—", { size: 9 }), { w: cw[1] }),
         K.cell(K.text(s.risk, { size: 9, bold: true, color: riskHex(s.risk) }), { w: cw[2] }),
         K.cell(K.text(s.description + (loc ? " [" + loc + "]" : ""), { size: 9 }), { w: cw[3] }),
-        K.cell(K.text(STATUS_LABEL[s.status] || s.status, { size: 9, color: STATUS_HEX[s.status] }), { w: cw[4] }),
+        K.cell(K.text(s.due_date || "—", { size: 9, bold: isOverdue(s), color: isOverdue(s) ? HR : undefined }), { w: cw[4] }),
+        K.cell(K.text(STATUS_LABEL[s.status] || s.status, { size: 9, color: STATUS_HEX[s.status] }), { w: cw[5] }),
       ]));
     });
     if (!snags.length) {
       rows.push(K.row([K.cell(K.text(mode === "open" ? "No open items." : "No items in this pack.",
-        { size: 9, align: "center" }), { w: W, span: 5 })]));
+        { size: 9, align: "center" }), { w: W, span: 6 })]));
     }
     doc.add(K.table(cw, rows));
 
@@ -1915,6 +1996,12 @@ const Report = (function () {
           const rl = refsLine(s);
           if (rl) bits.push(K.text("Reference: " + rl, { size: 8, spaceAfter: 2 }));
           if (s.contractor_response) bits.push(K.text("Contractor response: " + s.contractor_response, { size: 8, spaceAfter: 2 }));
+          // Due date and priority on one line; "overdue" is as of the day the report is made.
+          const late = isOverdue(s);
+          const sched = [];
+          if (s.due_date) sched.push("Due: " + s.due_date + (late ? " (overdue)" : ""));
+          if (s.priority) sched.push("Priority: " + s.priority.charAt(0).toUpperCase() + s.priority.slice(1));
+          if (sched.length) bits.push(K.text(sched.join("  ·  "), { size: 8, bold: late, color: late ? HR : undefined, spaceAfter: 2 }));
           bits.push(K.text("Status: " + (STATUS_LABEL[s.status] || s.status), {
             size: 8, bold: true, color: STATUS_HEX[s.status], spaceAfter: 2,
           }));
@@ -1927,7 +2014,8 @@ const Report = (function () {
           const last = (s.history || []).slice(-1)[0];
           if (last && last.at) {
             bits.push(K.text(STATUS_LABEL[last.to] + " " + localStamp(last.at) +
-              (last.by ? " · " + last.by : ""), { size: 7.5, color: "6B7F8F" }));
+              (last.by ? " · " + last.by : "") + (last.comment ? " · " + last.comment : ""),
+              { size: 7.5, color: "6B7F8F" }));
           }
           txtCells.push(K.cell(bits.join(""), { w: 5040 }));
         }
@@ -2022,23 +2110,30 @@ const Report = (function () {
   const CSV_COLUMNS = ["Snag ID", "Project", "Area", "Inspection", "Block/Table", "Support No",
     "Location", "Category", "Risk", "Description", "Required Action", "Contractor Response",
     "Due Date", "Priority", "Status", "Inspector", "Created", "Updated", "GPS Lat", "GPS Lng",
-    "Photos", "References"];
+    "Photos", "References", "Last status note", "Former Snag ID"];
 
   function buildCsv(insp, mode) {
     const project = projectOf(insp);
     const snags = filterSnags(snagsOf(insp.id), mode);
     const q = function (v) {
-      const s = v == null ? "" : String(v);
-      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+      let s = v == null ? "" : String(v);
+      // The register goes to clients and contractors, and Excel runs a cell
+      // starting with = + - @ as a formula, quoted or not. A leading ' keeps
+      // it as text. Numbers (a negative GPS reading) are left alone.
+      if (typeof v === "string" && /^[=+\-@\t\r]/.test(s)) s = "'" + s;
+      // A bare \r ends the row in Excel too, so it is quoted like \n.
+      return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
     const lines = [CSV_COLUMNS.join(",")];
     snags.forEach(function (s) {
+      const last = (s.history || []).slice(-1)[0];
       lines.push([s.code, project.name, insp.area, insp.number, s.block_table, s.support_no,
         s.location_text, s.category, s.risk, s.description, s.required_action, s.contractor_response,
         s.due_date, s.priority, STATUS_LABEL[s.status] || s.status, insp.inspector_name,
         localStamp(s.created_at, true), localStamp(s.updated_at, true),
         s.lat == null ? "" : s.lat, s.lng == null ? "" : s.lng,
-        (s.photos || []).length, refsLine(s)].map(q).join(","));
+        (s.photos || []).length, refsLine(s), last ? last.comment : "",
+        (s.previous_codes || []).join("; ")].map(q).join(","));
     });
     return new Blob(["\ufeff" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
   }
@@ -2133,8 +2228,8 @@ const Report = (function () {
       return String(s || "").replace(/[^\w\s-]/g, "").trim().replace(/\s+/g, "_").slice(0, 40);
     };
     const tag = mode === "open" ? "OpenItems" : mode === "closeout" ? "CloseOut" : "Full";
-    return insp.number + "_" + (safe(project.name) || "PunchList") + "_" + tag +
-      "_Rev" + rev + "_" + (insp.inspection_date || today());
+    return (safe(insp.number) || "Inspection") + "_" + (safe(project.name) || "PunchList") + "_" + tag +
+      "_Rev" + rev + "_" + (safe(insp.inspection_date) || today());
   }
 
   return {
@@ -2150,6 +2245,64 @@ function saveBlob(blob, filename) {
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
 }
+
+// A shared file needs a plain MIME type: Chrome refuses "text/csv;charset=…",
+// and the share sheet picks apps (Word, Excel, Drive) by it.
+const SHARE_MIME = {
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  csv: "text/csv", zip: "application/zip", json: "application/json",
+};
+function fileFor(blob, filename) {
+  const ext = filename.split(".").pop().toLowerCase();
+  return new File([blob], filename, { type: SHARE_MIME[ext] || blob.type || "application/octet-stream" });
+}
+
+/** True when this browser can hand a file like `filename` to the phone's share
+ *  sheet. Browsers allow different file types, so it is asked per type. */
+function canShareFile(filename) {
+  try {
+    return !!(navigator.canShare && navigator.share &&
+      navigator.canShare({ files: [fileFor(new Blob([]), filename)] }));
+  } catch (err) {
+    return false;
+  }
+}
+
+/** Send a file through the share sheet (mail, WhatsApp, Drive…). Resolves
+ *  "shared", "cancelled" or "downloaded": any failure other than the user
+ *  backing out falls back to a normal download, so the file is never lost.
+ *  With `afterWait`, a refusal because the tap was too long ago resolves
+ *  "expired" instead, so the caller can ask for a fresh tap. */
+async function shareBlob(blob, filename, afterWait) {
+  try {
+    await navigator.share({ files: [fileFor(blob, filename)], title: filename });
+    return "shared";
+  } catch (err) {
+    if (err && err.name === "AbortError") return "cancelled";
+    if (afterWait && err && err.name === "NotAllowedError") return "expired";
+    console.warn("Share failed, downloading instead", err);
+    saveBlob(blob, filename);
+    return "downloaded";
+  }
+}
+
+/** Share a file that took a while to build. Browsers only open the share
+ *  sheet within a few seconds of a tap, so if that has passed, show the file
+ *  as ready with a Share now button: a fresh tap. Resolves like shareBlob;
+ *  closing that sheet counts as "cancelled". */
+function shareBuilt(blob, filename) {
+  return shareBlob(blob, filename, true).then(function (how) {
+    if (how !== "expired") return how;
+    return new Promise(function (res) {
+      UI.hideToast();
+      App.modal = { type: "share" };   // so Escape closes it
+      App.shareReady = { blob: blob, filename: filename, done: res };
+      UI.openModal(UI.sheetHead("Ready to share") + '<div class="sheet-b">' +
+        '<p style="margin:0 0 12px"><b>' + esc(filename) + "</b> (" + esc(fmtBytes(blob.size)) + ") is ready.</p>" +
+        '<button class="btn btn-p" data-a="share-ready">Share now</button></div>');
+    });
+  });
+}
 /* ============================================================================
    Views. Every screen is a string of HTML; buttons carry data-a="action" and
    are handled by one delegated listener in app.js. Small, predictable, and it
@@ -2158,6 +2311,8 @@ function saveBlob(blob, filename) {
 const App = {
   route: "home", inspId: null, tab: "snags", snagId: null,
   filter: "all", query: "", placing: false, pinFor: null, modal: null, busy: false,
+  backupNagHidden: false,   // the home backup reminder, dismissed until the next load
+  shareReady: null,         // a built file waiting for its Share now tap
 };
 
 const UI = (function () {
@@ -2170,6 +2325,20 @@ const UI = (function () {
     el.className = "toast show" + (bad ? " bad" : "");
     clearTimeout(toastTimer);
     toastTimer = setTimeout(function () { el.className = "toast" + (bad ? " bad" : ""); }, ms || 2600);
+  }
+  // Clears a long "Building…" toast when there is nothing to say after it.
+  function hideToast() {
+    clearTimeout(toastTimer);
+    document.getElementById("toast").className = "toast";
+  }
+
+  /** A download button, with a "Share…" button beside it when this browser can
+   *  share that kind of file. `attrs` are the download button's data-a/data-v;
+   *  the share button repeats them with data-share, so one action does both. */
+  function withShare(btn, attrs, filename, what) {
+    if (!canShareFile(filename)) return btn;
+    return '<div class="btn-row">' + btn +
+      '<button class="btn btn-share" ' + attrs + ' data-share="1" aria-label="Share ' + esc(what) + '">Share…</button></div>';
   }
 
   const tag = function (cls, txt) { return '<span class="tag ' + esc(cls) + '">' + esc(txt) + "</span>"; };
@@ -2263,6 +2432,57 @@ const UI = (function () {
     return Store.get().inspections.find(function (i) { return i.id === App.inspId; }) || null;
   }
 
+  /* ---------------------------------------------------- backup reminder --- */
+  /** What the home screen should say about backups, or null for nothing.
+   *  Everything lives on one phone, so remind until a recent copy exists. */
+  function backupDue() {
+    const st = Store.get();
+    if (!st.projects.length && !st.inspections.length && !st.snags.length) return null;
+    const last = Date.parse(st.settings.last_backup_at || "");
+    if (isNaN(last)) return { never: true };
+    // A data-only backup leaves the photos on this phone alone, so they have
+    // their own clock: the last full backup.
+    const full = Date.parse(st.settings.last_full_backup_at || "");
+    const hasPhotos = st.snags.some(function (s) { return (s.photos || []).length; }) ||
+      st.inspections.some(function (i) { return (i.photos || []).length || i.site_photo_id || i.site_plan_id; });
+    if (hasPhotos && isNaN(full)) return { photosNever: true };
+    const day = 24 * 60 * 60 * 1000;
+    // A day's grace after each backup, and no reminder when nothing changed.
+    if (Date.now() - last < day || !(Date.parse(st.updated_at) > last)) {
+      if (hasPhotos && Date.now() - full >= day && Date.parse(st.settings.photos_changed_at || "") > full) {
+        return { photosAt: st.settings.last_full_backup_at };
+      }
+      return null;
+    }
+    const after = function (iso) { return Date.parse(iso || "") > last; };
+    return {
+      at: st.settings.last_backup_at,
+      snags: st.snags.filter(function (s) { return after(s.updated_at) || after(s.created_at); }).length,
+      inspections: st.inspections.filter(function (i) { return after(i.created_at); }).length,
+    };
+  }
+
+  function backupNag() {
+    const due = App.backupNagHidden ? null : backupDue();
+    if (!due) return "";
+    let text = "This phone holds the only copy — back up now";
+    if (due.photosNever) {
+      text = "Photos have never been backed up — this phone holds the only copy";
+    } else if (due.photosAt) {
+      text = "Photos not backed up since " + localStamp(due.photosAt) + " — new or changed photos are only on this phone";
+    } else if (!due.never) {
+      const bits = [];
+      if (due.snags) bits.push(due.snags + " snag" + (due.snags > 1 ? "s" : "") + " changed");
+      if (due.inspections) bits.push(due.inspections + " new inspection" + (due.inspections > 1 ? "s" : ""));
+      // Deletes and project edits leave nothing to count, but still changed the data.
+      text = "Not backed up since " + localStamp(due.at) + " — " + (bits.length ? bits.join(", ") : "changes since then");
+    }
+    return '<div class="banner warn" style="align-items:center"><span>!</span>' +
+      '<span style="flex:1;min-width:0">' + esc(text) + "</span>" +
+      '<button class="btn btn-p btn-xs" data-a="backup" data-v="full">Back up now</button>' +
+      '<button class="btn btn-xs" data-a="hide-backup-nag" aria-label="Hide this reminder">✕</button></div>';
+  }
+
   /* --------------------------------------------------------------- home --- */
   function viewHome() {
     const st = Store.get();
@@ -2270,7 +2490,7 @@ const UI = (function () {
     let hits = "";
     if (q.length > 1) {
       const found = st.snags.filter(function (s) {
-        return (s.code + " " + s.description + " " + s.block_table + " " + s.location_text +
+        return (s.code + " " + (s.previous_codes || []).join(" ") + " " + s.description + " " + s.block_table + " " + s.location_text +
           " " + s.required_action).toLowerCase().indexOf(q) >= 0;
       }).slice(0, 40);
       hits = '<div class="card"><div class="card-h"><h2>Search results</h2><span class="count">' +
@@ -2295,7 +2515,8 @@ const UI = (function () {
         '<div class="chiprow" style="margin:9px 0 11px">' +
         '<span class="count hr">' + esc(t.outstanding) + " open</span>" +
         '<span class="count">' + esc(t.hrOpen) + " HR open</span>" +
-        '<span class="count ok">' + esc(t.done) + " done</span></div>" +
+        '<span class="count ok">' + esc(t.done) + " done</span>" +
+        (t.overdue ? '<span class="count hr">' + esc(t.overdue) + " overdue</span>" : "") + "</div>" +
         (insps.length ? insps.map(inspectionRow).join("") :
           '<div class="muted" style="padding:6px 0 10px">No inspections yet.</div>') +
         '<div class="btn-row" style="margin-top:10px">' +
@@ -2303,7 +2524,7 @@ const UI = (function () {
         "</div></div></div>";
     }).join("");
 
-    return '<div class="stack">' +
+    return '<div class="stack">' + backupNag() +
       '<div class="card"><div class="card-b" style="padding:10px">' +
       '<input class="inp" id="q" placeholder="Search all snags — code, description, table" value="' + esc(App.query) + '" />' +
       "</div></div>" + hits +
@@ -2343,7 +2564,10 @@ const UI = (function () {
       (s.pin_x != null ? '<span class="tag" style="color:var(--ink-3)">pin</span>' : "") + "</span>" +
       '<span class="desc">' + esc(s.description || "(no description yet)") + "</span>" +
       '<span class="meta">' + esc(showCode ? s.code : loc || s.code) +
-      ((s.photos || []).length ? " · " + esc(s.photos.length) + "📷" : "") + "</span></button>";
+      ((s.photos || []).length ? " · " + esc(s.photos.length) + "📷" : "") +
+      // Red once it is past due, so late items stand out while scrolling.
+      (s.due_date ? " · <span" + (isOverdue(s) ? ' class="late"' : "") + ">Due " + esc(s.due_date) + "</span>" : "") +
+      "</span></button>";
   }
 
   function viewSnags(insp) {
@@ -2354,11 +2578,12 @@ const UI = (function () {
       if (f === "open") return DONE.indexOf(s.status) < 0;
       if (f === "hr") return s.risk === "HR" && DONE.indexOf(s.status) < 0;
       if (f === "done") return DONE.indexOf(s.status) >= 0;
+      if (f === "overdue") return isOverdue(s);
       if (f === "nophoto") return !(s.photos || []).length;
       return true;
     });
     const chips = [["all", "All " + t.total], ["open", "Open " + t.outstanding], ["hr", "HR open " + t.hrOpen],
-    ["done", "Done " + t.done], ["nophoto", "No photo"]];
+    ["overdue", "Overdue " + t.overdue], ["done", "Done " + t.done], ["nophoto", "No photo"]];
 
     const list = shown.length ? shown.map(function (s) { return snagRow(s); }).join("")
       : '<div class="empty"><b>Nothing here</b>' +
@@ -2394,6 +2619,9 @@ const UI = (function () {
     return '<div class="stack">' +
       '<div class="card"><div class="card-h"><h2>Inspection</h2><span class="mono muted">' + esc(insp.number) + "</span></div>" +
       '<div class="card-b">' +
+      ((insp.previous_numbers || []).length
+        ? '<p class="muted" style="margin:0 0 10px">Formerly <span class="mono">' + esc(insp.previous_numbers.join(", ")) +
+          "</span>: renumbered when a backup from another phone was merged.</p>" : "") +
       field("Project", select("project_id", insp.project_id, st.projects.map(function (x) { return [x.id, x.name || "Untitled"]; }))) +
       '<div class="grid2">' +
       field("Project area", input("area", insp.area, { placeholder: "e.g. Carport block CP8" })) +
@@ -2496,11 +2724,16 @@ const UI = (function () {
 
       '<div class="card"><div class="card-h"><h2>Word packs</h2><span class="mono muted">Rev ' + esc(insp.rev || 0) + "</span></div>" +
       '<div class="card-b stack">' +
-      '<button class="btn btn-p" data-a="export" data-v="full">Full report — all ' + esc(t.total) + " items</button>" +
-      '<button class="btn" data-a="export" data-v="open">Open items only — ' + esc(t.outstanding) + "</button>" +
-      '<button class="btn" data-a="export" data-v="closeout">Close-out pack — ' + esc(t.done) + " verified</button>" +
-      '<button class="btn" data-a="export-csv">CSV register (Excel)</button>' +
-      '<p class="muted">Files land in your Downloads folder. Filename: ' +
+      withShare('<button class="btn btn-p" data-a="export" data-v="full">Full report — all ' + esc(t.total) + " items</button>",
+        'data-a="export" data-v="full"', "x.docx", "full report") +
+      withShare('<button class="btn" data-a="export" data-v="open">Open items only — ' + esc(t.outstanding) + "</button>",
+        'data-a="export" data-v="open"', "x.docx", "open items report") +
+      withShare('<button class="btn" data-a="export" data-v="closeout">Close-out pack — ' + esc(t.done) + " verified</button>",
+        'data-a="export" data-v="closeout"', "x.docx", "close-out pack") +
+      withShare('<button class="btn" data-a="export-csv">CSV register (Excel)</button>',
+        'data-a="export-csv"', "x.csv", "CSV register") +
+      '<p class="muted">Files land in your Downloads folder' +
+      (canShareFile("x.docx") ? "; Share… sends one straight to mail, WhatsApp or Drive" : "") + ". Filename: " +
       '<span class="mono">' + esc(Report.fileBase(insp, "full", insp.rev || 0)) + ".docx</span></p>" +
       "</div></div>" +
 
@@ -2551,6 +2784,11 @@ const UI = (function () {
       '<p class="muted" style="margin:8px 0 0">' +
       (usage ? esc(fmtBytes(usage.used) + " used" + (usage.quota ? " of about " + fmtBytes(usage.quota) + " available" : "")) +
         " · " + esc(usage.photoCount) + " photos (" + esc(fmtBytes(usage.photoBytes)) + ")" : "Measuring…") + "</p>" +
+      (usage && usage.persisted === true
+        ? '<p class="muted" style="margin:6px 0 0">Storage is persistent: the browser will not clear it on its own.</p>'
+        : usage && usage.persisted === false
+          ? '<p class="muted" style="margin:6px 0 0"><b>Storage is not persistent</b> — the browser may clear it when space runs low. Keep your backups current.</p>'
+          : "") +
       '<div class="banner warn" style="margin-top:10px"><span>!</span><span><b>Chrome can clear this</b>' +
       "Clearing site data, or uninstalling the app, deletes every inspection on this device. Export a backup after each site visit.</span></div>" +
       "</div></div>" +
@@ -2560,8 +2798,16 @@ const UI = (function () {
       "</div></div>" +
 
       '<div class="card"><div class="card-h"><h2>Backup & restore</h2></div><div class="card-b stack">' +
-      '<button class="btn btn-p" data-a="backup" data-v="full">Back up everything (with photos)</button>' +
-      '<button class="btn" data-a="backup" data-v="light">Back up data only (small, no photos)</button>' +
+      '<p style="margin:0">Last backup: ' + (s.last_backup_at
+        ? "<b>" + esc(localStamp(s.last_backup_at, true)) + "</b> (" + (s.last_backup_full ? "full" : "data only") + ")"
+        : "<b>never</b>") +
+      (s.last_backup_at && !s.last_backup_full
+        ? "<br>Last with photos: <b>" + (s.last_full_backup_at ? esc(localStamp(s.last_full_backup_at, true)) : "never") + "</b>" : "") +
+      "</p>" +
+      withShare('<button class="btn btn-p" data-a="backup" data-v="full">Back up everything (with photos)</button>',
+        'data-a="backup" data-v="full"', "x.zip", "full backup") +
+      withShare('<button class="btn" data-a="backup" data-v="light">Back up data only (small, no photos)</button>',
+        'data-a="backup" data-v="light"', "x.json", "data-only backup") +
       '<button class="btn" data-a="restore">Restore from a backup file…</button>' +
       '<p class="muted">A full backup is one .zip file; a data-only backup is a small .json. Email it to yourself or drop it in your project folder — that file is the only copy that survives a lost phone. Restore the file as saved; do not unzip it.</p>' +
       "</div></div>" +
@@ -2645,6 +2891,8 @@ const UI = (function () {
   function closeModal() {
     document.getElementById("modal").innerHTML = "";
     App.modal = null;
+    // A built file closed without its Share now tap was not sent.
+    if (App.shareReady) { const r = App.shareReady; App.shareReady = null; r.done("cancelled"); }
   }
   function sheetHead(title, extra) {
     return '<div class="sheet-h"><h2>' + esc(title) + "</h2>" + (extra || "") +
@@ -2652,7 +2900,7 @@ const UI = (function () {
   }
 
   return {
-    toast: toast, render: render, hydrate: hydrate, chrome: chrome,
+    toast: toast, hideToast: hideToast, render: render, hydrate: hydrate, chrome: chrome,
     openModal: openModal, closeModal: closeModal, sheetHead: sheetHead,
     field: field, input: input, dateField: dateField, textarea: textarea, select: select, seg: seg,
     riskTag: riskTag, statusTag: statusTag, snagRow: snagRow, bar: bar,
@@ -2737,8 +2985,13 @@ const UI = (function () {
     App.snagId = id;
     const st = Store.get();
     const done = DONE.indexOf(s.status) >= 0;
+    // Tell the user up front when new photos will not be saved as Before.
+    const kindNote = newPhotoKind(s) === "closeout"
+      ? '<span style="display:block;margin-top:4px">New photos are saved as Close-out (status is ' +
+        esc(STATUS_LABEL[s.status] || s.status) + "). Tap a photo's label to change it.</span>"
+      : " Tap the label on a photo to switch it between Before, After and Close-out.";
 
-    const photos = (s.photos || []).map(function (pid) {
+    const photos =(s.photos || []).map(function (pid) {
       // The kind label sits beside the photo button, not inside it, so tapping
       // the label only changes the kind and never opens the viewer.
       return '<div class="photocell"><button type="button" class="ph" data-a="view-photo" data-id="' + esc(pid) + '" aria-label="View photo">' +
@@ -2778,7 +3031,7 @@ const UI = (function () {
       '<div class="photogrid" style="margin-bottom:10px">' + photos +
       '<button class="dropzone" data-a="pick-photo" data-v="snag" style="min-height:104px">Library</button>' +
       '<button class="dropzone" data-a="take-photo" data-v="snag" style="min-height:104px">Camera</button></div>' +
-      '<p class="muted" style="margin:-4px 0 12px">Library picks from the phone. Camera opens the camera. Tap the label on a photo to switch it between Before, After and Close-out.</p>' +
+      '<p class="muted" style="margin:-4px 0 12px">Library picks from the phone. Camera opens the camera.' + kindNote + "</p>" +
 
       '<div class="btn-row" style="margin-bottom:12px">' + statusBtns + "</div>" +
 
@@ -2893,13 +3146,13 @@ const UI = (function () {
 
   /* ------------------------------------------------------------ photos --- */
   let fileInput = null;
-  function pickFile(accept, useCamera) {
+  function pickFile(accept, useCamera, single) {
     return new Promise(function (res) {
       if (fileInput) fileInput.remove();
       fileInput = document.createElement("input");
       fileInput.type = "file";
       fileInput.accept = accept || "image/*";
-      fileInput.multiple = !useCamera;
+      fileInput.multiple = !useCamera && !single;
       if (useCamera) fileInput.setAttribute("capture", "environment");
       fileInput.style.display = "none";
       let settled = false;
@@ -2920,6 +3173,11 @@ const UI = (function () {
     });
   }
 
+  // The kind a new snag photo gets: Close-out once the snag is fixed or later.
+  function newPhotoKind(s) {
+    return s && CLOSEOUT_STATUSES.indexOf(s.status) >= 0 ? "closeout" : "before";
+  }
+
   async function addPhotos(target, kindHint, useCamera) {
     const files = await pickFile("image/*", !!useCamera);
     if (!files.length) return;
@@ -2928,9 +3186,13 @@ const UI = (function () {
     // Decide the snag now: the user may close this sheet or open another one
     // while the photos are still being processed.
     const snag = target === "snag" && App.modal && App.modal.type === "snag" ? snagById(App.modal.id) : null;
+    // Snag photos take their kind from the snag's status, decided once so a
+    // batch never ends up split across two kinds.
+    const kind = snag ? newPhotoKind(snag) : kindHint || "before";
+    let added = 0, failed = 0;
     for (const f of files) {
       try {
-        const rec = await Store.addPhoto(f, { kind: kindHint || "before" });
+        const rec = await Store.addPhoto(f, { kind: kind });
         if (target === "site") {
           if (i.site_photo_id) await Store.delPhoto(i.site_photo_id);
           i.site_photo_id = rec.id;
@@ -2940,8 +3202,10 @@ const UI = (function () {
         } else if (snag) {
           snag.photos.push(rec.id);
           snag.updated_at = new Date().toISOString();
+          added++;
         }
       } catch (err) {
+        failed++;
         UI.toast(err.message || "That photo could not be added", true, 5000);
       }
     }
@@ -2949,6 +3213,10 @@ const UI = (function () {
     UI.clearUsage();
     if (snag && App.modal && App.modal.type === "snag" && App.modal.id === snag.id) snagSheet(snag.id);
     UI.render();
+    // Say which kind the photos were saved as. Leave an error toast showing.
+    if (added && !failed) {
+      UI.toast(added + " " + (kind === "closeout" ? "close-out" : "before") + " photo" + (added > 1 ? "s" : "") + " added");
+    }
   }
 
   function parseCoords(text) {
@@ -3242,7 +3510,14 @@ const UI = (function () {
           "Verify without a close-out photo?\n\nTag a photo as After or Close-out first, or the close-out pack will show text only for this item."
         )) return;
       }
-      const comment = "";
+      // Sign-off moves get an optional note (who witnessed it, what was redone).
+      // Cancel backs out of the change; an empty note is fine.
+      let comment = "";
+      if (to === "verified" || to === "verification_failed" || to === "open") {
+        const note = prompt("Note for this change (optional) — e.g. re-torqued, witnessed by J. Smith", "");
+        if (note === null) return;
+        comment = note.trim();
+      }
       s.history = s.history || [];
       s.history.push({
         from: s.status, to: to, at: new Date().toISOString(),
@@ -3315,13 +3590,14 @@ const UI = (function () {
       UI.toast("Pin placed for snag " + s.snag_number);
     },
 
+    // For a snag, addPhotos picks the kind from the snag's status.
     "pick-photo": function (el) {
       const v = el.getAttribute("data-v");
-      addPhotos(v, v === "snag" ? "before" : v, false);
+      addPhotos(v, v === "snag" ? "" : v, false);
     },
     "take-photo": function (el) {
       const v = el.getAttribute("data-v");
-      addPhotos(v, v === "snag" ? "before" : v, true);
+      addPhotos(v, v === "snag" ? "" : v, true);
     },
     "clear-photo": function (el) {
       const i = insp(), which = el.getAttribute("data-v");
@@ -3344,6 +3620,9 @@ const UI = (function () {
       const order = ["before", "after", "closeout"];
       p.kind = order[(order.indexOf(p.kind) + 1) % order.length];
       await Store.idbPut("photos", p);
+      // Kinds live with the photo, so only a full backup carries the change.
+      Store.get().settings.photos_changed_at = new Date().toISOString();
+      Store.save();
       el.textContent = p.kind === "closeout" ? "Close-out" : p.kind === "after" ? "After" : "Before";
       UI.toast("Marked " + el.textContent.toLowerCase());
     },
@@ -3440,23 +3719,30 @@ const UI = (function () {
     "export": async function (el) {
       if (App.busy) return;
       const mode = el.getAttribute("data-v");
+      const share = el.hasAttribute("data-share");
       const i = insp();
       App.busy = true;
       UI.toast("Building the Word file…", false, 20000);
       try {
         const blob = await Report.buildDocx(i, mode, i.rev || 0);
-        saveBlob(blob, Report.fileBase(i, mode, i.rev || 0) + ".docx");
-        UI.toast("Downloaded " + fmtBytes(blob.size));
+        const name = Report.fileBase(i, mode, i.rev || 0) + ".docx";
+        let how = "downloaded";
+        if (share) how = await shareBuilt(blob, name);
+        else saveBlob(blob, name);
+        if (how === "cancelled") UI.hideToast();
+        else UI.toast((how === "shared" ? "Shared " : "Downloaded ") + fmtBytes(blob.size));
       } catch (err) {
         console.error(err);
         UI.toast("Export failed: " + (err.message || err), true, 8000);
       }
       App.busy = false;
     },
-    "export-csv": function () {
+    "export-csv": async function (el) {
       const i = insp();
-      saveBlob(Report.buildCsv(i, "full"), Report.fileBase(i, "full", i.rev || 0) + ".csv");
-      UI.toast("CSV downloaded");
+      const blob = Report.buildCsv(i, "full"), name = Report.fileBase(i, "full", i.rev || 0) + ".csv";
+      if (!el.hasAttribute("data-share")) { saveBlob(blob, name); UI.toast("CSV downloaded"); return; }
+      const how = await shareBlob(blob, name);
+      if (how !== "cancelled") UI.toast(how === "shared" ? "CSV shared" : "CSV downloaded");
     },
     "new-revision": function () {
       const i = insp(), st = Store.get();
@@ -3478,16 +3764,42 @@ const UI = (function () {
       const withPhotos = el.getAttribute("data-v") === "full";
       UI.toast("Preparing backup…", false, 20000);
       try {
-        const blob = await Store.backup(withPhotos);
+        const made = await Store.backup(withPhotos);
+        const blob = made.blob;
         const name = "LumaxPunchList_backup_" + today() + (withPhotos ? "_full.zip" : "_data.json");
-        saveBlob(blob, name);
-        UI.toast("Backup saved · " + fmtBytes(blob.size));
+        let how = "downloaded";
+        if (el.hasAttribute("data-share")) how = await shareBuilt(blob, name);
+        else saveBlob(blob, name);
+        // Backing out of the share sheet saved nothing, so it is not a backup.
+        if (how === "cancelled") return UI.hideToast();
+        const s = Store.get().settings;
+        // Edits made while the file was built are not in it.
+        const editedSince = Date.parse(Store.get().updated_at) > Date.parse(made.at);
+        s.last_backup_full = withPhotos;
+        if (withPhotos) s.last_full_backup_at = made.at;
+        Store.save();
+        // save() has just stamped updated_at; take the same moment, so this
+        // save is not itself counted as a change since the backup. The write
+        // is debounced, so it still carries the value set here.
+        s.last_backup_at = editedSince ? made.at : Store.get().updated_at;
+        UI.render();
+        UI.toast((how === "shared" ? "Backup shared · " : "Backup saved · ") + fmtBytes(blob.size));
       } catch (err) {
         UI.toast("Backup failed: " + (err.message || err), true, 7000);
       }
     },
+    "share-ready": function () {
+      const r = App.shareReady;
+      if (!r) return;
+      App.shareReady = null;
+      // Straight from this tap, before anything waits, so the sheet may open.
+      const p = shareBlob(r.blob, r.filename);
+      UI.closeModal();
+      p.then(r.done);
+    },
+    "hide-backup-nag": function () { App.backupNagHidden = true; UI.render(); },
     "restore": async function () {
-      const files = await pickFile(".json,.zip,application/json,application/zip", false);
+      const files = await pickFile(".json,.zip,application/json,application/zip", false, true);
       if (!files.length) return;
       if (!confirm("Restore this backup into this device?\n\nCancel stops. Nothing will change.")) return;
       const mode = confirm("OK = replace everything here with the backup (photos it still uses are kept)\nCancel = merge, keeping what is already here") ? "replace" : "merge";
@@ -3505,7 +3817,11 @@ const UI = (function () {
           msg += " · " + rn.length + " inspection" + (rn.length > 1 ? "s" : "") + " renumbered: " +
             rn.map(function (r) { return r.from + " → " + r.to; }).join(", ");
         }
-        if (res.missingPhotos) {
+        if (res.missingPhotos && res.photosLeftOut) {
+          // backup.json without its photos folder: the data is back, the photos are not.
+          UI.toast(msg + " · " + res.missingPhotos + " photo" + (res.missingPhotos > 1 ? "s are" : " is") +
+            " not on this device: that was backup.json on its own. Restore the original _full.zip to bring them back.", true, 9000);
+        } else if (res.missingPhotos) {
           UI.toast(msg + " · " + res.missingPhotos + " photo" + (res.missingPhotos > 1 ? "s are" : " is") +
             " not on this device. Restore a full backup to bring them back.", true, 9000);
         } else {
@@ -3562,7 +3878,14 @@ const UI = (function () {
       App.modal.draft[name.slice(2)] = value;
     } else if (name.indexOf("ph.") === 0) {
       const pid = name.slice(3);
-      Store.getPhoto(pid).then(function (p) { if (p) { p.caption = value; Store.idbPut("photos", p); } });
+      Store.getPhoto(pid).then(function (p) {
+        if (!p) return;
+        p.caption = value;
+        Store.idbPut("photos", p);
+        // Captions live with the photo, so only a full backup carries them.
+        Store.get().settings.photos_changed_at = new Date().toISOString();
+        Store.save();
+      });
       return;
     } else if (name.indexOf("gps.") === 0 && App.modal && App.modal.type === "gps") {
       App.modal.draft = App.modal.draft || {};
