@@ -479,6 +479,8 @@ const DEFAULT_SETTINGS = {
   legend: "Hot Dip Galvanised (HDG); Spring Washer (SW); Flat Washer (FW); Large Washer (LW); Corrugated Washer (CW); Threaded Rod (TR); Installation Manual (IM)",
   photo_max_edge: 1600,
   photo_quality: 0.82,
+  last_backup_at: "",       // set by each successful backup; drives the home reminder
+  last_backup_full: false,
 };
 /* ============================================================================
    docx.js — a small, self-contained Word (.docx) writer.
@@ -946,7 +948,8 @@ const Store = (function () {
     const out = Object.assign(blank(), s);
     out.settings = Object.assign({}, DEFAULT_SETTINGS, isObj(s.settings) ? s.settings : {});
     asText(out.settings, ["company_name", "report_title", "company_footer", "inspection_prefix",
-      "inspector_name", "risk_legend", "legend"]);
+      "inspector_name", "risk_legend", "legend", "last_backup_at"]);
+    out.settings.last_backup_full = out.settings.last_backup_full === true;
     out.settings.photo_max_edge = asNum(out.settings.photo_max_edge) || DEFAULT_SETTINGS.photo_max_edge;
     out.settings.photo_quality = asNum(out.settings.photo_quality) || DEFAULT_SETTINGS.photo_quality;
     ["projects", "inspections", "snags", "templates", "remarks", "revisions"].forEach(function (k) {
@@ -1514,10 +1517,15 @@ const Store = (function () {
     if (navigator.storage && navigator.storage.estimate) {
       try { const e = await navigator.storage.estimate(); quota = e.quota || 0; used = e.usage || 0; } catch (err) { }
     }
+    // null = this browser cannot say, which the screen treats as unknown.
+    let persisted = null;
+    if (navigator.storage && navigator.storage.persisted) {
+      try { persisted = await navigator.storage.persisted(); } catch (err) { }
+    }
     const photos = await idbAll("photos");
     let bytes = 0;
     photos.forEach(function (p) { bytes += (p.blob && p.blob.size) || 0; });
-    return { quota: quota, used: used, photoCount: photos.length, photoBytes: bytes };
+    return { quota: quota, used: used, photoCount: photos.length, photoBytes: bytes, persisted: persisted };
   }
 
   /** Ids of every photo a snag or inspection in `s` points at. */
@@ -2158,6 +2166,7 @@ function saveBlob(blob, filename) {
 const App = {
   route: "home", inspId: null, tab: "snags", snagId: null,
   filter: "all", query: "", placing: false, pinFor: null, modal: null, busy: false,
+  backupNagHidden: false,   // the home backup reminder, dismissed until the next load
 };
 
 const UI = (function () {
@@ -2263,6 +2272,41 @@ const UI = (function () {
     return Store.get().inspections.find(function (i) { return i.id === App.inspId; }) || null;
   }
 
+  /* ---------------------------------------------------- backup reminder --- */
+  /** What the home screen should say about backups, or null for nothing.
+   *  Everything lives on one phone, so remind until a recent copy exists. */
+  function backupDue() {
+    const st = Store.get();
+    if (!st.projects.length && !st.inspections.length && !st.snags.length) return null;
+    const last = Date.parse(st.settings.last_backup_at || "");
+    if (isNaN(last)) return { never: true };
+    // A day's grace after each backup, and no reminder when nothing changed.
+    if (Date.now() - last < 24 * 60 * 60 * 1000 || !(Date.parse(st.updated_at) > last)) return null;
+    const after = function (iso) { return Date.parse(iso || "") > last; };
+    return {
+      at: st.settings.last_backup_at,
+      snags: st.snags.filter(function (s) { return after(s.updated_at) || after(s.created_at); }).length,
+      inspections: st.inspections.filter(function (i) { return after(i.created_at); }).length,
+    };
+  }
+
+  function backupNag() {
+    const due = App.backupNagHidden ? null : backupDue();
+    if (!due) return "";
+    let text = "This phone holds the only copy — back up now";
+    if (!due.never) {
+      const bits = [];
+      if (due.snags) bits.push(due.snags + " snag" + (due.snags > 1 ? "s" : "") + " changed");
+      if (due.inspections) bits.push(due.inspections + " new inspection" + (due.inspections > 1 ? "s" : ""));
+      // Deletes and project edits leave nothing to count, but still changed the data.
+      text = "Not backed up since " + localStamp(due.at) + " — " + (bits.length ? bits.join(", ") : "changes since then");
+    }
+    return '<div class="banner warn" style="align-items:center"><span>!</span>' +
+      '<span style="flex:1;min-width:0">' + esc(text) + "</span>" +
+      '<button class="btn btn-p btn-xs" data-a="backup" data-v="full">Back up now</button>' +
+      '<button class="btn btn-xs" data-a="hide-backup-nag" aria-label="Hide this reminder">✕</button></div>';
+  }
+
   /* --------------------------------------------------------------- home --- */
   function viewHome() {
     const st = Store.get();
@@ -2303,7 +2347,7 @@ const UI = (function () {
         "</div></div></div>";
     }).join("");
 
-    return '<div class="stack">' +
+    return '<div class="stack">' + backupNag() +
       '<div class="card"><div class="card-b" style="padding:10px">' +
       '<input class="inp" id="q" placeholder="Search all snags — code, description, table" value="' + esc(App.query) + '" />' +
       "</div></div>" + hits +
@@ -2551,6 +2595,11 @@ const UI = (function () {
       '<p class="muted" style="margin:8px 0 0">' +
       (usage ? esc(fmtBytes(usage.used) + " used" + (usage.quota ? " of about " + fmtBytes(usage.quota) + " available" : "")) +
         " · " + esc(usage.photoCount) + " photos (" + esc(fmtBytes(usage.photoBytes)) + ")" : "Measuring…") + "</p>" +
+      (usage && usage.persisted === true
+        ? '<p class="muted" style="margin:6px 0 0">Storage is persistent: the browser will not clear it on its own.</p>'
+        : usage && usage.persisted === false
+          ? '<p class="muted" style="margin:6px 0 0"><b>Storage is not persistent</b> — the browser may clear it when space runs low. Keep your backups current.</p>'
+          : "") +
       '<div class="banner warn" style="margin-top:10px"><span>!</span><span><b>Chrome can clear this</b>' +
       "Clearing site data, or uninstalling the app, deletes every inspection on this device. Export a backup after each site visit.</span></div>" +
       "</div></div>" +
@@ -2560,6 +2609,9 @@ const UI = (function () {
       "</div></div>" +
 
       '<div class="card"><div class="card-h"><h2>Backup & restore</h2></div><div class="card-b stack">' +
+      '<p style="margin:0">Last backup: ' + (s.last_backup_at
+        ? "<b>" + esc(localStamp(s.last_backup_at, true)) + "</b> (" + (s.last_backup_full ? "full" : "data only") + ")"
+        : "<b>never</b>") + "</p>" +
       '<button class="btn btn-p" data-a="backup" data-v="full">Back up everything (with photos)</button>' +
       '<button class="btn" data-a="backup" data-v="light">Back up data only (small, no photos)</button>' +
       '<button class="btn" data-a="restore">Restore from a backup file…</button>' +
@@ -3481,11 +3533,20 @@ const UI = (function () {
         const blob = await Store.backup(withPhotos);
         const name = "LumaxPunchList_backup_" + today() + (withPhotos ? "_full.zip" : "_data.json");
         saveBlob(blob, name);
+        const s = Store.get().settings;
+        s.last_backup_full = withPhotos;
+        Store.save();
+        // save() has just stamped updated_at; take the same moment, so this
+        // save is not itself counted as a change since the backup. The write
+        // is debounced, so it still carries the value set here.
+        s.last_backup_at = Store.get().updated_at;
+        UI.render();
         UI.toast("Backup saved · " + fmtBytes(blob.size));
       } catch (err) {
         UI.toast("Backup failed: " + (err.message || err), true, 7000);
       }
     },
+    "hide-backup-nag": function () { App.backupNagHidden = true; UI.render(); },
     "restore": async function () {
       const files = await pickFile(".json,.zip,application/json,application/zip", false);
       if (!files.length) return;
