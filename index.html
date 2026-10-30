@@ -205,7 +205,7 @@ textarea.inp{min-height:82px;resize:vertical;line-height:1.4}
   text-transform:uppercase;background:rgba(15,48,74,.86);color:#fff;padding:2px 5px;border-radius:4px;
 }
 .photocell .x{
-  position:absolute;right:3px;top:3px;width:26px;height:26px;border-radius:13px;border:0;
+  position:absolute;right:3px;top:3px;width:34px;height:34px;border-radius:17px;border:0;
   background:rgba(180,35,24,.92);color:#fff;font-size:15px;line-height:1;font-weight:700;
 }
 .dropzone{
@@ -1302,6 +1302,14 @@ function today() {
   const d = new Date();
   return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
 }
+/** A stored timestamp (ISO, UTC) as this device's local date, or date and time. */
+function localStamp(iso, withTime) {
+  const d = new Date(iso || "");
+  if (!iso || isNaN(d.getTime())) return "";
+  const p2 = function (n) { return String(n).padStart(2, "0"); };
+  const date = d.getFullYear() + "-" + p2(d.getMonth() + 1) + "-" + p2(d.getDate());
+  return withTime ? date + " " + p2(d.getHours()) + ":" + p2(d.getMinutes()) : date;
+}
 function esc(s) {
   return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
     .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
@@ -1348,7 +1356,11 @@ const Model = {
   snag: function (inspection, o) {
     const st = Store.get();
     const mine = st.snags.filter(function (s) { return s.inspection_id === inspection.id; });
-    const n = mine.reduce(function (m, s) { return Math.max(m, s.snag_number || 0); }, 0) + 1;
+    // last_snag_number only ever goes up, so deleting the newest snag does
+    // not hand its number and code to the next one.
+    const n = mine.reduce(function (m, s) { return Math.max(m, s.snag_number || 0); },
+      Number(inspection.last_snag_number) || 0) + 1;
+    inspection.last_snag_number = n;
     return Object.assign({
       id: uid(), inspection_id: inspection.id, snag_number: n,
       code: inspection.number + "-" + String(n).padStart(3, "0"),
@@ -1575,6 +1587,7 @@ const Report = (function () {
     if (snags.length) {
       doc.add(K.pageBreak());
       doc.add(K.text("Problems & Pictures", { size: 13, bold: true, color: NAVY }));
+      const caption = function (p) { return p && p.caption ? K.text(p.caption, { size: 8, align: "center" }) : ""; };
       const pp = [];
       for (let i = 0; i < snags.length; i += 2) {
         const pair = snags.slice(i, i + 2);
@@ -1583,9 +1596,15 @@ const Report = (function () {
           const s = pair[j];
           if (!s) { imgCells.push(K.cell("", { w: 5040 })); txtCells.push(K.cell("", { w: 5040 })); continue; }
           const shots = await photosFor(s);
-          const before = shots.find(function (p) { return p.kind === "before"; }) || shots[0] || null;
+          // Close-out and after shots are evidence of the fix and go under
+          // "Close-out evidence", so they are not reused as the problem photo,
+          // except in the open-items pack, which has no evidence section.
+          const isEvidence = function (p) { return p.kind === "closeout" || p.kind === "after"; };
+          const before = shots.find(function (p) { return p.kind === "before"; }) ||
+            shots.find(function (p) { return !isEvidence(p); }) ||
+            (mode === "open" ? shots[0] : null) || null;
           const pic = before && doc.picture(before, 78, 62);
-          imgCells.push(K.cell(pic ? K.para(pic, { align: "center" })
+          imgCells.push(K.cell(pic ? K.para(pic, { align: "center" }) + caption(before)
             : K.text("No photograph", { size: 9, align: "center" }), { w: 5040 }));
 
           const bits = [K.text(s.code + " — " + s.risk, { size: 9, bold: true, color: riskHex(s.risk) })];
@@ -1600,15 +1619,15 @@ const Report = (function () {
           bits.push(K.text("Status: " + (STATUS_LABEL[s.status] || s.status), {
             size: 8, bold: true, color: STATUS_HEX[s.status], spaceAfter: 2,
           }));
-          const closeout = shots.filter(function (p) { return p.kind === "closeout" || p.kind === "after"; });
+          const closeout = shots.filter(isEvidence);
           if (closeout.length && mode !== "open") {
             bits.push(K.text("Close-out evidence:", { size: 8, bold: true, spaceAfter: 1 }));
             const cp = doc.picture(closeout[0], 50, 42);
-            if (cp) bits.push(K.para(cp, { align: "center" }));
+            if (cp) bits.push(K.para(cp, { align: "center" }) + caption(closeout[0]));
           }
           const last = (s.history || []).slice(-1)[0];
           if (last && last.at) {
-            bits.push(K.text(STATUS_LABEL[last.to] + " " + last.at.slice(0, 10) +
+            bits.push(K.text(STATUS_LABEL[last.to] + " " + localStamp(last.at) +
               (last.by ? " · " + last.by : ""), { size: 7.5, color: "6B7F8F" }));
           }
           txtCells.push(K.cell(bits.join(""), { w: 5040 }));
@@ -1718,7 +1737,7 @@ const Report = (function () {
       lines.push([s.code, project.name, insp.area, insp.number, s.block_table, s.support_no,
         s.location_text, s.category, s.risk, s.description, s.required_action, s.contractor_response,
         s.due_date, s.priority, STATUS_LABEL[s.status] || s.status, insp.inspector_name,
-        (s.created_at || "").slice(0, 19), (s.updated_at || "").slice(0, 19),
+        localStamp(s.created_at, true), localStamp(s.updated_at, true),
         s.lat == null ? "" : s.lat, s.lng == null ? "" : s.lng,
         (s.photos || []).length, refsLine(s)].map(q).join(","));
     });
@@ -2045,7 +2064,7 @@ const UI = (function () {
     const st = Store.get();
     const p = projectOf(insp);
     const cover = insp.site_photo_id
-      ? '<img data-pid="' + insp.site_photo_id + '" style="width:100%;border-radius:9px;border:1px solid var(--line)" alt="Site cover photo" />' +
+      ? '<img data-pid="' + insp.site_photo_id + '" data-a="view-photo" data-id="' + insp.site_photo_id + '" style="width:100%;border-radius:9px;border:1px solid var(--line)" alt="Site cover photo — tap to add a caption" />' +
       '<div class="btn-row" style="margin-top:8px"><button class="btn btn-sm" data-a="pick-photo" data-v="site">Library</button>' +
       '<button class="btn btn-sm" data-a="take-photo" data-v="site">Camera</button>' +
       '<button class="btn btn-sm btn-d" data-a="clear-photo" data-v="site">Remove</button></div>'
@@ -2164,7 +2183,7 @@ const UI = (function () {
       '<button class="btn btn-xs" data-a="new-revision">＋ Issue revision</button></div>' +
       '<div class="card-b">' + (revs.length ? revs.map(function (r) {
         return '<div class="row" style="cursor:default"><div class="grow"><b>Rev ' + r.rev + " — " + esc(r.reason || "no reason given") + "</b>" +
-          '<span class="sub">' + esc((r.created_at || "").slice(0, 10)) + " · " + r.snag_count + " items · " + esc(r.by || "") + "</span></div></div>";
+          '<span class="sub">' + esc(localStamp(r.created_at)) + " · " + r.snag_count + " items · " + esc(r.by || "") + "</span></div></div>";
       }).join("") : '<div class="muted">No revision issued yet. Issuing one stamps the revision number onto the header and footer of the exported Word file.</div>') +
       "</div></div>" +
       "</div>";
@@ -2417,7 +2436,7 @@ const UI = (function () {
 
     const history = (s.history || []).slice().reverse().map(function (h) {
       return '<div class="check"><span class="m">→</span><span>' + esc(STATUS_LABEL[h.to] || h.to) +
-        '<span class="muted" style="display:block">' + esc((h.at || "").slice(0, 16).replace("T", " ")) +
+        '<span class="muted" style="display:block">' + esc(localStamp(h.at, true)) +
         (h.by ? " · " + esc(h.by) : "") + (h.comment ? " · " + esc(h.comment) : "") + "</span></span></div>";
     }).join("");
 
@@ -2577,6 +2596,9 @@ const UI = (function () {
     if (!files.length) return;
     UI.toast("Processing " + files.length + " photo" + (files.length > 1 ? "s" : "") + "…");
     const i = insp();
+    // Decide the snag now: the user may close this sheet or open another one
+    // while the photos are still being processed.
+    const snag = target === "snag" && App.modal && App.modal.type === "snag" ? snagById(App.modal.id) : null;
     for (const f of files) {
       try {
         const rec = await Store.addPhoto(f, { kind: kindHint || "before" });
@@ -2586,10 +2608,9 @@ const UI = (function () {
         } else if (target === "plan") {
           if (i.site_plan_id) await Store.delPhoto(i.site_plan_id);
           i.site_plan_id = rec.id;
-        } else if (target === "snag" && App.modal && App.modal.type === "snag") {
-          const s = snagById(App.modal.id);
-          s.photos.push(rec.id);
-          s.updated_at = new Date().toISOString();
+        } else if (snag) {
+          snag.photos.push(rec.id);
+          snag.updated_at = new Date().toISOString();
         }
       } catch (err) {
         UI.toast(err.message || "That photo could not be added", true, 5000);
@@ -2597,7 +2618,7 @@ const UI = (function () {
     }
     await Store.save();
     UI.clearUsage();
-    if (App.modal && App.modal.type === "snag") snagSheet(App.modal.id);
+    if (snag && App.modal && App.modal.type === "snag" && App.modal.id === snag.id) snagSheet(snag.id);
     UI.render();
   }
 
@@ -2718,7 +2739,7 @@ const UI = (function () {
 
   /* ------------------------------------------------------------ actions -- */
   const actions = {
-    "go-home": function () { App.route = "home"; App.inspId = null; UI.render(); },
+    "go-home": function () { App.route = "home"; App.inspId = null; App.placing = false; App.pinFor = null; UI.render(); },
     "go-library": function () { App.route = "library"; UI.render(); },
     "go-settings": function () { App.route = "settings"; UI.render(); },
     "tab": function (el) { App.tab = el.getAttribute("data-v"); App.placing = false; UI.render(); },
@@ -2758,12 +2779,13 @@ const UI = (function () {
       st.inspections.push(i);
       Store.save();
       App.route = "inspection"; App.inspId = i.id; App.tab = "info";
+      App.placing = false; App.pinFor = null;
       UI.render();
       UI.toast("Inspection " + i.number + " created");
     },
     "open-inspection": function (el) {
       App.route = "inspection"; App.inspId = el.getAttribute("data-id"); App.tab = "snags";
-      App.filter = "all"; UI.render();
+      App.filter = "all"; App.placing = false; App.pinFor = null; UI.render();
     },
     "delete-inspection": async function () {
       const st = Store.get(), i = insp();
@@ -2808,7 +2830,16 @@ const UI = (function () {
     },
     "open-snag": function (el) {
       const id = el.getAttribute("data-id");
-      if (App.placing) return;
+      if (App.placing && App.route === "inspection" && App.tab === "plan") return;
+      const s = snagById(id);
+      if (!s) return;
+      // From Home search the sheet would open with no inspection behind it,
+      // and Duplicate, Copy to tables and Place pin all need one.
+      if (App.route !== "inspection" || App.inspId !== s.inspection_id) {
+        App.route = "inspection"; App.inspId = s.inspection_id; App.tab = "snags"; App.filter = "all";
+        UI.render();
+      }
+      App.placing = false; App.pinFor = null;
       snagSheet(id);
     },
     "del-snag": function () {
@@ -2972,6 +3003,7 @@ const UI = (function () {
     },
     "del-photo": function (el) {
       const s = snagById(App.modal.id), pid = el.getAttribute("data-id");
+      if (!confirm("Delete this photo? This cannot be undone.")) return;
       s.photos = s.photos.filter(function (x) { return x !== pid; });
       Store.delPhoto(pid);
       Store.save(); snagSheet(s.id); UI.clearUsage();
@@ -2991,10 +3023,13 @@ const UI = (function () {
       const url = await Store.photoUrl(pid);
       const p = await Store.getPhoto(pid);
       if (!url) return;
+      const fromSnag = App.modal && App.modal.type === "snag";
+      if (!fromSnag) App.modal = { type: "photo", id: pid };   // so Escape closes it
       UI.openModal(UI.sheetHead("Photo") + '<div class="sheet-b">' +
         '<img src="' + url + '" style="width:100%;border-radius:9px" alt="" />' +
         UI.field("Caption", UI.input("ph." + pid, (p && p.caption) || "", { placeholder: "Shown under the photo in the report" })) +
-        '<button class="btn" data-a="back-to-snag">Back to snag</button></div>');
+        (fromSnag ? '<button class="btn" data-a="back-to-snag">Back to snag</button>'
+          : '<button class="btn" data-a="close-modal">Done</button>') + "</div>");
     },
     "back-to-snag": function () { snagSheet(App.snagId); },
 
@@ -3041,6 +3076,7 @@ const UI = (function () {
     },
     "delete-template": function () {
       const st = Store.get();
+      if (!confirm("Delete this template? Restoring Lumax defaults will not bring back your own templates.")) return;
       st.templates = st.templates.filter(function (x) { return x.id !== App.modal.id; });
       Store.save(); UI.closeModal(); UI.render(); UI.toast("Template removed");
     },
@@ -3054,6 +3090,7 @@ const UI = (function () {
     },
     "delete-remark": function () {
       const st = Store.get();
+      if (!confirm("Delete this remark?")) return;
       st.remarks = st.remarks.filter(function (x) { return x.id !== App.modal.id; });
       Store.save(); UI.closeModal(); UI.render(); UI.toast("Removed");
     },
@@ -3347,7 +3384,8 @@ const UI = (function () {
     };
     document.getElementById("brandmark").src = "data:image/png;base64," + LUMAX_LOGO_B64;
     document.getElementById("btnHome").addEventListener("click", function () {
-      App.route = "home"; App.inspId = null; UI.closeModal(); UI.render();
+      App.route = "home"; App.inspId = null; App.placing = false; App.pinFor = null;
+      UI.closeModal(); UI.render();
     });
     const sun = document.getElementById("btnSun");
     if (localStorage.getItem("lumax-sun") === "1") { document.body.classList.add("sun"); sun.classList.add("on"); }
