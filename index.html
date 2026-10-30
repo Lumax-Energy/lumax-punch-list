@@ -269,6 +269,7 @@ textarea.inp{min-height:82px;resize:vertical;line-height:1.4}
 .check:last-child{border-bottom:0}
 .check .m{font-weight:800;font-family:var(--mono);flex:0 0 20px}
 .check.pass .m{color:var(--ok)} .check.fail .m{color:var(--hr)} .check.warn .m{color:var(--lr)}
+.check.wait .m{color:var(--ink-3)}
 
 /* ── progress ──────────────────────────────────────────────────────────── */
 .bar{height:8px;border-radius:4px;background:var(--band);overflow:hidden;display:flex}
@@ -961,6 +962,8 @@ const Store = (function () {
       // A pin needs both coordinates, and a GPS fix needs both halves.
       if (sn.pin_x == null || sn.pin_y == null) { sn.pin_x = null; sn.pin_y = null; }
       if (sn.lat == null || sn.lng == null) { sn.lat = null; sn.lng = null; }
+      // Older builds saved a transient photo-kind list on each snag; it was never real data.
+      delete sn._kinds;
     });
     out.inspections.forEach(function (i) {
       asText(i, ["id", "number", "project_id", "area", "type", "inspection_date", "next_inspection_date",
@@ -2059,15 +2062,20 @@ const Report = (function () {
     add(noAction.length ? "warn" : "pass",
       noAction.length ? noAction.length + " snags have no required action" : "Every snag has a required action", "");
 
+    // Photo kinds live in the photos store, so this reads the cache refreshEvidence() fills.
+    const verified = snags.filter(function (s) { return DONE.indexOf(s.status) >= 0; });
     const verifiedNoEvidence = [];
-    snags.filter(function (s) { return DONE.indexOf(s.status) >= 0; }).forEach(function (s) {
-      const kinds = (s._kinds || []);
-      if (!kinds.length) verifiedNoEvidence.push(s.snag_number);
+    let unchecked = false;
+    verified.forEach(function (s) {
+      if (!evidence.has(s.id)) unchecked = true;
+      else if (!evidence.get(s.id)) verifiedNoEvidence.push(s.snag_number);
     });
-    if (verifiedNoEvidence.length) {
+    if (unchecked) {
+      add("wait", "Checking close-out photos…", "");
+    } else if (verifiedNoEvidence.length) {
       add("warn", verifiedNoEvidence.length + " verified snags have no close-out photo",
         "Snags " + verifiedNoEvidence.join(", ") + " — the close-out pack will show text only.");
-    } else if (snags.some(function (s) { return DONE.indexOf(s.status) >= 0; })) {
+    } else if (verified.length) {
       add("pass", "Verified snags carry close-out evidence", "");
     }
 
@@ -2087,17 +2095,24 @@ const Report = (function () {
     return { checks: out, ready: ready };
   }
 
-  /** Attach photo kinds so pre-flight can see close-out evidence. */
-  async function annotate(insp) {
-    const snags = snagsOf(insp.id);
-    for (const s of snags) {
-      const kinds = [];
+  /* Snag id -> has an After/Close-out photo. Kept out of state on purpose:
+   * it is derived from the photo records and must never be saved. */
+  const evidence = new Map();
+
+  /** Re-read photo kinds for the verified snags. Resolves true only when an
+   *  answer changed, so the caller re-renders once and then stops. */
+  async function refreshEvidence(insp) {
+    let changed = false;
+    for (const s of snagsOf(insp.id)) {
+      if (DONE.indexOf(s.status) < 0) continue;
+      let has = false;
       for (const id of (s.photos || [])) {
         const p = await Store.getPhoto(id);
-        if (p && (p.kind === "closeout" || p.kind === "after")) kinds.push(p.kind);
+        if (p && (p.kind === "closeout" || p.kind === "after")) { has = true; break; }
       }
-      s._kinds = kinds;
+      if (evidence.get(s.id) !== has) { evidence.set(s.id, has); changed = true; }
     }
+    return changed;
   }
 
   function fileBase(insp, mode, rev) {
@@ -2111,7 +2126,7 @@ const Report = (function () {
   }
 
   return {
-    buildDocx: buildDocx, buildCsv: buildCsv, preflight: preflight, annotate: annotate,
+    buildDocx: buildDocx, buildCsv: buildCsv, preflight: preflight, refreshEvidence: refreshEvidence,
     renderMap: renderMap, fileBase: fileBase, filterSnags: filterSnags,
   };
 })();
@@ -2447,6 +2462,11 @@ const UI = (function () {
     const revs = Store.get().revisions.filter(function (r) { return r.inspection_id === insp.id; })
       .sort(function (a, b) { return b.rev - a.rev; });
     const t = tally(snagsOf(insp.id));
+    // Photo kinds sit in IndexedDB, so check them after paint and redraw only
+    // if an answer changed; the redraw finds nothing new and stops there.
+    Report.refreshEvidence(insp).then(function (changed) {
+      if (changed && App.route === "inspection" && App.tab === "report" && App.inspId === insp.id) render();
+    }).catch(function (err) { console.error(err); });
 
     return '<div class="stack">' +
       '<div class="banner ' + (pf.ready ? "good" : "bad") + '"><span>' + (pf.ready ? "✓" : "✕") + "</span>" +
@@ -2456,8 +2476,9 @@ const UI = (function () {
       '<div class="card"><div class="card-h"><h2>Pre-flight</h2><span class="count">' + esc(t.total) + " snags</span></div>" +
       '<div class="card-b">' + pf.checks.map(function (c) {
         return '<div class="check ' + esc(c.level) + '"><span class="m">' +
-          (c.level === "pass" ? "✓" : c.level === "warn" ? "!" : "✕") + "</span><span>" + esc(c.text) +
-          (c.fix ? '<span class="muted" style="display:block">' + esc(c.fix) + "</span>" : "") + "</span></div>";
+          (c.level === "pass" ? "✓" : c.level === "warn" ? "!" : c.level === "wait" ? "…" : "✕") + "</span><span>" + esc(c.text) +
+          // A hint is how to fix something, so a passing check does not need one.
+          (c.fix && c.level !== "pass" ? '<span class="muted" style="display:block">' + esc(c.fix) + "</span>" : "") + "</span></div>";
       }).join("") + "</div></div>" +
 
       '<div class="card"><div class="card-h"><h2>Word packs</h2><span class="mono muted">Rev ' + esc(insp.rev || 0) + "</span></div>" +
@@ -3407,7 +3428,6 @@ const UI = (function () {
       App.busy = true;
       UI.toast("Building the Word file…", false, 20000);
       try {
-        await Report.annotate(i);
         const blob = await Report.buildDocx(i, mode, i.rev || 0);
         saveBlob(blob, Report.fileBase(i, mode, i.rev || 0) + ".docx");
         UI.toast("Downloaded " + fmtBytes(blob.size));
