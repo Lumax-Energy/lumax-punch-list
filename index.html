@@ -164,8 +164,9 @@ textarea.inp{min-height:82px;resize:vertical;line-height:1.4}
 }
 .rail.r-HR .num{background:var(--hr)} .rail.r-LR .num{background:var(--lr)}
 .rail.done .num{background:var(--ok)}
-.rail .desc{font-size:14px;line-height:1.35;color:var(--ink);word-break:break-word}
-.rail .meta{font-size:11.5px;color:var(--ink-3);margin-top:4px;font-family:var(--mono)}
+.rail .desc{display:block;font-size:14px;line-height:1.35;color:var(--ink);word-break:break-word}
+.rail .meta{display:block;font-size:11.5px;color:var(--ink-3);margin-top:4px;font-family:var(--mono)}
+.rail .meta .late{color:var(--hr);font-weight:700}
 .rail .thumb{
   float:right;width:58px;height:58px;object-fit:cover;border-radius:7px;margin:0 0 6px 10px;
   border:1px solid var(--line);background:var(--band);
@@ -1699,9 +1700,15 @@ function inspectionsOf(projectId) {
     .filter(function (i) { return i.project_id === projectId; })
     .sort(function (a, b) { return (b.inspection_date || "").localeCompare(a.inspection_date || ""); });
 }
+/** Past its due date and not yet verified/closed. Due dates are local
+ *  YYYY-MM-DD strings, so a plain string compare against today() works. */
+function isOverdue(s) {
+  return !!s.due_date && s.due_date < today() && DONE.indexOf(s.status) < 0;
+}
 function tally(snags) {
-  const t = { total: snags.length, open: 0, hrOpen: 0, done: 0, prog: 0 };
+  const t = { total: snags.length, open: 0, hrOpen: 0, done: 0, prog: 0, overdue: 0 };
   snags.forEach(function (s) {
+    if (isOverdue(s)) t.overdue++;
     if (DONE.indexOf(s.status) >= 0) t.done++;
     else if (s.status === "open") { t.open++; if (s.risk === "HR") t.hrOpen++; }
     else { t.prog++; if (s.risk === "HR") t.hrOpen++; }
@@ -1873,8 +1880,10 @@ const Report = (function () {
       " high risk), " + t.done + " verified/closed.", { size: 10, bold: true }));
 
     /* snag summary table ------------------------------------------------ */
-    const head = ["Snag ID", "Block/Table", "Impact", "Description", "Status"];
-    const cw = [1500, 1500, 900, 4680, 1500];
+    // Widths must add up to W. Due takes its 1100 from Block/Table, Impact
+    // and Description; a YYYY-MM-DD date fits on one line at 9 pt.
+    const head = ["Snag ID", "Block/Table", "Impact", "Description", "Due", "Status"];
+    const cw = [1500, 1300, 800, 3880, 1100, 1500];
     const rows = [K.row(head.map(function (h, i) {
       return K.cell(K.text(h, { size: 9, bold: true, color: "FFFFFF" }), { w: cw[i], bg: NAVY });
     }), { header: true })];
@@ -1885,12 +1894,13 @@ const Report = (function () {
         K.cell(K.text(s.block_table || "—", { size: 9 }), { w: cw[1] }),
         K.cell(K.text(s.risk, { size: 9, bold: true, color: riskHex(s.risk) }), { w: cw[2] }),
         K.cell(K.text(s.description + (loc ? " [" + loc + "]" : ""), { size: 9 }), { w: cw[3] }),
-        K.cell(K.text(STATUS_LABEL[s.status] || s.status, { size: 9, color: STATUS_HEX[s.status] }), { w: cw[4] }),
+        K.cell(K.text(s.due_date || "—", { size: 9, bold: isOverdue(s), color: isOverdue(s) ? HR : undefined }), { w: cw[4] }),
+        K.cell(K.text(STATUS_LABEL[s.status] || s.status, { size: 9, color: STATUS_HEX[s.status] }), { w: cw[5] }),
       ]));
     });
     if (!snags.length) {
       rows.push(K.row([K.cell(K.text(mode === "open" ? "No open items." : "No items in this pack.",
-        { size: 9, align: "center" }), { w: W, span: 5 })]));
+        { size: 9, align: "center" }), { w: W, span: 6 })]));
     }
     doc.add(K.table(cw, rows));
 
@@ -1927,6 +1937,12 @@ const Report = (function () {
           const rl = refsLine(s);
           if (rl) bits.push(K.text("Reference: " + rl, { size: 8, spaceAfter: 2 }));
           if (s.contractor_response) bits.push(K.text("Contractor response: " + s.contractor_response, { size: 8, spaceAfter: 2 }));
+          // Due date and priority on one line; "overdue" is as of the day the report is made.
+          const late = isOverdue(s);
+          const sched = [];
+          if (s.due_date) sched.push("Due: " + s.due_date + (late ? " (overdue)" : ""));
+          if (s.priority) sched.push("Priority: " + s.priority.charAt(0).toUpperCase() + s.priority.slice(1));
+          if (sched.length) bits.push(K.text(sched.join("  ·  "), { size: 8, bold: late, color: late ? HR : undefined, spaceAfter: 2 }));
           bits.push(K.text("Status: " + (STATUS_LABEL[s.status] || s.status), {
             size: 8, bold: true, color: STATUS_HEX[s.status], spaceAfter: 2,
           }));
@@ -2394,7 +2410,8 @@ const UI = (function () {
         '<div class="chiprow" style="margin:9px 0 11px">' +
         '<span class="count hr">' + esc(t.outstanding) + " open</span>" +
         '<span class="count">' + esc(t.hrOpen) + " HR open</span>" +
-        '<span class="count ok">' + esc(t.done) + " done</span></div>" +
+        '<span class="count ok">' + esc(t.done) + " done</span>" +
+        (t.overdue ? '<span class="count hr">' + esc(t.overdue) + " overdue</span>" : "") + "</div>" +
         (insps.length ? insps.map(inspectionRow).join("") :
           '<div class="muted" style="padding:6px 0 10px">No inspections yet.</div>') +
         '<div class="btn-row" style="margin-top:10px">' +
@@ -2442,7 +2459,10 @@ const UI = (function () {
       (s.pin_x != null ? '<span class="tag" style="color:var(--ink-3)">pin</span>' : "") + "</span>" +
       '<span class="desc">' + esc(s.description || "(no description yet)") + "</span>" +
       '<span class="meta">' + esc(showCode ? s.code : loc || s.code) +
-      ((s.photos || []).length ? " · " + esc(s.photos.length) + "📷" : "") + "</span></button>";
+      ((s.photos || []).length ? " · " + esc(s.photos.length) + "📷" : "") +
+      // Red once it is past due, so late items stand out while scrolling.
+      (s.due_date ? " · <span" + (isOverdue(s) ? ' class="late"' : "") + ">Due " + esc(s.due_date) + "</span>" : "") +
+      "</span></button>";
   }
 
   function viewSnags(insp) {
@@ -2453,11 +2473,12 @@ const UI = (function () {
       if (f === "open") return DONE.indexOf(s.status) < 0;
       if (f === "hr") return s.risk === "HR" && DONE.indexOf(s.status) < 0;
       if (f === "done") return DONE.indexOf(s.status) >= 0;
+      if (f === "overdue") return isOverdue(s);
       if (f === "nophoto") return !(s.photos || []).length;
       return true;
     });
     const chips = [["all", "All " + t.total], ["open", "Open " + t.outstanding], ["hr", "HR open " + t.hrOpen],
-    ["done", "Done " + t.done], ["nophoto", "No photo"]];
+    ["overdue", "Overdue " + t.overdue], ["done", "Done " + t.done], ["nophoto", "No photo"]];
 
     const list = shown.length ? shown.map(function (s) { return snagRow(s); }).join("")
       : '<div class="empty"><b>Nothing here</b>' +
