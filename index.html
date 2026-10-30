@@ -3011,8 +3011,9 @@ const UI = (function () {
     const done = DONE.indexOf(s.status) >= 0;
     const loc = [s.block_table, s.support_no ? "Supp " + s.support_no : "", s.location_text]
       .filter(Boolean).join(" · ");
-    const thumb = (s.photos || []).length
-      ? '<img class="thumb" data-pid="' + esc(s.photos[0]) + '"' + thumbSrc(s.photos[0]) + ' alt="" />' : "";
+    const kept = Report.keptPhotos(s);
+    const thumb = kept.length
+      ? '<img class="thumb" data-pid="' + esc(kept[0]) + '"' + thumbSrc(kept[0]) + ' alt="" />' : "";
     return '<button class="rail r-' + esc(s.risk) + (done ? " done" : "") + '" data-a="open-snag" data-id="' + esc(s.id) + '">' +
       thumb +
       '<span class="rh"><span class="num">' + esc(s.snag_number) + "</span>" +
@@ -3020,10 +3021,18 @@ const UI = (function () {
       (s.pin_x != null ? '<span class="tag" style="color:var(--ink-3)">pin</span>' : "") + "</span>" +
       '<span class="desc">' + esc(s.description || "(no description yet)") + "</span>" +
       '<span class="meta">' + esc(showCode ? s.code : loc || s.code) +
-      ((s.photos || []).length ? " · " + esc(s.photos.length) + "📷" : "") +
+      (kept.length ? " · " + esc(kept.length) + "📷" : "") +
       // Red once it is past due, so late items stand out while scrolling.
       (s.due_date ? " · <span" + (isOverdue(s) ? ' class="late"' : "") + ">Due " + esc(s.due_date) + "</span>" : "") +
       "</span></button>";
+  }
+
+  // Photos listed on an inspection may not be stored here (a data-only restore),
+  // so check after paint and redraw only if one went missing or came back.
+  function checkPhotos(insp, tab) {
+    Report.refreshPhotos(insp).then(function (changed) {
+      if (changed && App.route === "inspection" && App.tab === tab && App.inspId === insp.id) render();
+    }).catch(function (err) { console.error(err); });
   }
 
   function viewSnags(insp) {
@@ -3038,11 +3047,7 @@ const UI = (function () {
       if (f === "nophoto") return !Report.keptPhotos(s).length;
       return true;
     });
-    // Photos listed on a snag may not be stored here (a data-only restore),
-    // so check after paint and redraw only if one went missing or came back.
-    Report.refreshPhotos(insp).then(function (changed) {
-      if (changed && App.route === "inspection" && App.tab === "snags" && App.inspId === insp.id) render();
-    }).catch(function (err) { console.error(err); });
+    checkPhotos(insp, "snags");
     const chips = [["all", "All " + t.total], ["open", "Open " + t.outstanding], ["hr", "HR open " + t.hrOpen],
     ["overdue", "Overdue " + t.overdue], ["done", "Done " + t.done], ["nophoto", "No photo"]];
 
@@ -3067,7 +3072,13 @@ const UI = (function () {
   function viewInfo(insp) {
     const st = Store.get();
     const p = projectOf(insp);
-    const cover = insp.site_photo_id
+    checkPhotos(insp, "info");
+    const cover = Report.photoMissing(insp.site_photo_id)
+      ? '<p class="muted" style="margin:0 0 8px">The cover photo is not on this device. Restore the full backup (…_full.zip) to bring it back, or pick a new one.</p>' +
+      '<div class="btn-row"><button class="btn btn-sm" data-a="pick-photo" data-v="site">Library</button>' +
+      '<button class="btn btn-sm" data-a="take-photo" data-v="site">Camera</button>' +
+      '<button class="btn btn-sm btn-d" data-a="clear-photo" data-v="site">Remove</button></div>'
+      : insp.site_photo_id
       ? '<button type="button" class="ph" data-a="view-photo" data-id="' + esc(insp.site_photo_id) + '">' +
       '<img data-pid="' + esc(insp.site_photo_id) + '" style="width:100%;border-radius:9px;border:1px solid var(--line)" alt="Site cover photo — tap to add a caption" /></button>' +
       '<div class="btn-row" style="margin-top:8px"><button class="btn btn-sm" data-a="pick-photo" data-v="site">Library</button>' +
@@ -3126,12 +3137,16 @@ const UI = (function () {
         esc(s.snag_number) + "</button>";
     }).join("");
 
-    const plan = insp.site_plan_id
+    checkPhotos(insp, "plan");
+    const planGone = Report.photoMissing(insp.site_plan_id);
+    const plan = insp.site_plan_id && !planGone
       ? '<div class="planwrap' + (App.placing ? " placing" : "") + '" id="planwrap" data-a="plan-tap">' +
       '<img data-pid="' + esc(insp.site_plan_id) + '" alt="Site plan" />' + pins + "</div>"
       : '<div class="planwrap' + (App.placing ? " placing" : "") + '" id="planwrap" data-a="plan-tap" ' +
       'style="min-height:230px;background-image:linear-gradient(#D8E0E8 1px,transparent 1px),linear-gradient(90deg,#D8E0E8 1px,transparent 1px);background-size:34px 34px">' +
-      pins + '<div class="empty" style="pointer-events:none">No site plan loaded — pins land on a plain grid</div></div>';
+      pins + '<div class="empty" style="pointer-events:none">' + (planGone
+        ? "The site plan image is not on this device — restore the full backup (…_full.zip). Pins show on a plain grid"
+        : "No site plan loaded — pins land on a plain grid") + "</div></div>";
 
     return '<div class="stack">' +
       (App.placing ? '<div class="banner info"><span>◎</span><span><b>Placing pin for snag ' +
