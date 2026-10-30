@@ -793,6 +793,7 @@ const DocxKit = (function () {
   return {
     Doc: Doc, zip: zip, run: run, para: para, text: text, cell: cell, row: row,
     table: table, pageBreak: pageBreak, mmTwip: mmTwip, mmEmu: mmEmu, esc: esc,
+    crc32: crc32, dosTime: dosTime,   // the full backup .zip uses these too
   };
 })();
 
@@ -1171,18 +1172,175 @@ const Store = (function () {
   }
 
   /* ------------------------------------------------------- backup/restore -- */
+  /* A full backup is a store-only .zip: backup.json (the data, with photo
+     details but no photo bytes) plus one photos/<id>.jpg per photo. The old
+     full backup put every photo in one JSON string as base64, which ran
+     phones out of memory on big sites. Here the zip is a Blob built from
+     parts, so the photo bytes are never copied into one big buffer. */
+  const ZIP_DAMAGED = "This backup .zip is damaged or incomplete.";
+
+  /** CRC and length of one entry. The bytes are dropped on return, so only
+   *  one photo is ever read into memory at a time. */
+  async function crcOf(data) {
+    const bytes = await toBytes(data);
+    return bytes ? { crc: DocxKit.crc32(bytes), size: bytes.length } : { crc: 0, size: 0 };
+  }
+
+  /** [{ name, data: Blob | bytes }] → a store-only zip Blob. */
+  async function zipBlob(entries) {
+    if (entries.length > 0xffff) throw new Error("Too many photos for one backup file.");
+    const now = DocxKit.dosTime(new Date());
+    const enc = new TextEncoder();
+    const parts = [];
+    const central = [];
+    let offset = 0;
+    for (const e of entries) {
+      const name = enc.encode(e.name);
+      const sum = await crcOf(e.data);
+      // Plain zip offsets stop at 4 GB; fail clearly rather than write a
+      // file nothing can open.
+      if (offset + 30 + name.length + sum.size > 0xffffffff) {
+        throw new Error("This backup would be over 4 GB. Remove unused photos, or back up data only.");
+      }
+      const local = new DataView(new ArrayBuffer(30));
+      local.setUint32(0, 0x04034b50, true);
+      local.setUint16(4, 20, true);          // version needed
+      local.setUint16(6, 0x0800, true);      // flags: names are UTF-8
+      local.setUint16(8, 0, true);           // method: store
+      local.setUint16(10, now.time, true);
+      local.setUint16(12, now.date, true);
+      local.setUint32(14, sum.crc, true);
+      local.setUint32(18, sum.size, true);
+      local.setUint32(22, sum.size, true);
+      local.setUint16(26, name.length, true);
+      // The photo Blob itself goes in as a part: the browser points at it
+      // instead of copying it into memory.
+      parts.push(local.buffer, name, e.data);
+
+      const cd = new DataView(new ArrayBuffer(46));
+      cd.setUint32(0, 0x02014b50, true);
+      cd.setUint16(4, 20, true);
+      cd.setUint16(6, 20, true);
+      cd.setUint16(8, 0x0800, true);
+      cd.setUint16(12, now.time, true);
+      cd.setUint16(14, now.date, true);
+      cd.setUint32(16, sum.crc, true);
+      cd.setUint32(20, sum.size, true);
+      cd.setUint32(24, sum.size, true);
+      cd.setUint16(28, name.length, true);
+      cd.setUint32(42, offset, true);
+      central.push(cd.buffer, name);
+
+      offset += 30 + name.length + sum.size;
+    }
+    let centralSize = 0;
+    central.forEach(function (c) { centralSize += c.byteLength; });
+    if (offset + centralSize > 0xffffffff) {
+      throw new Error("This backup would be over 4 GB. Remove unused photos, or back up data only.");
+    }
+    const end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054b50, true);
+    end.setUint16(8, entries.length, true);
+    end.setUint16(10, entries.length, true);
+    end.setUint32(12, centralSize, true);
+    end.setUint32(16, offset, true);
+    return new Blob(parts.concat(central, [end.buffer]), { type: "application/zip" });
+  }
+
+  /** Bytes [a, b) of a file as a DataView. */
+  async function readRange(file, a, b) {
+    const u = await toBytes(file.slice(a, b));
+    return new DataView(u.buffer, u.byteOffset, u.byteLength);
+  }
+
+  /** The entries of a store-only zip, found through the central directory
+   *  at the end of the file. Only the directory is read; each entry comes
+   *  back as a slice of the file, so no photo is read or decoded here.
+   *  Returns Map name → { blob, crc }. */
+  async function unzipBlob(file) {
+    // The end record is 22 bytes plus a comment of up to 64 KB.
+    const tailStart = Math.max(0, file.size - (22 + 0xffff));
+    const tail = await readRange(file, tailStart, file.size);
+    let end = -1;
+    for (let i = tail.byteLength - 22; i >= 0; i--) {
+      if (tail.getUint32(i, true) === 0x06054b50) { end = i; break; }
+    }
+    if (end < 0) throw new Error(ZIP_DAMAGED);
+    const count = tail.getUint16(end + 10, true);
+    const cdSize = tail.getUint32(end + 12, true);
+    const cdStart = tail.getUint32(end + 16, true);
+    if (cdStart + cdSize > tailStart + end) throw new Error(ZIP_DAMAGED);
+    const cd = await readRange(file, cdStart, cdStart + cdSize);
+    const dec = new TextDecoder();
+    const out = new Map();
+    let pos = 0;
+    for (let n = 0; n < count; n++) {
+      if (pos + 46 > cd.byteLength || cd.getUint32(pos, true) !== 0x02014b50) throw new Error(ZIP_DAMAGED);
+      const method = cd.getUint16(pos + 10, true);
+      const crc = cd.getUint32(pos + 16, true);
+      const size = cd.getUint32(pos + 20, true);
+      const nameLen = cd.getUint16(pos + 28, true);
+      const skip = nameLen + cd.getUint16(pos + 30, true) + cd.getUint16(pos + 32, true);
+      const at = cd.getUint32(pos + 42, true);
+      if (pos + 46 + skip > cd.byteLength) throw new Error(ZIP_DAMAGED);
+      const name = dec.decode(new Uint8Array(cd.buffer, cd.byteOffset + pos + 46, nameLen));
+      pos += 46 + skip;
+      if (method !== 0) {
+        throw new Error("This backup .zip was re-compressed by another app. Restore the file the app saved.");
+      }
+      // The local header can carry its own extra field, so the data starts
+      // where that header says, not where the central copy implies.
+      const local = await readRange(file, at, at + 30);
+      if (local.byteLength < 30 || local.getUint32(0, true) !== 0x04034b50) throw new Error(ZIP_DAMAGED);
+      const start = at + 30 + local.getUint16(26, true) + local.getUint16(28, true);
+      if (start + size > cdStart) throw new Error(ZIP_DAMAGED);
+      out.set(name, { blob: file.slice(start, start + size), crc: crc });
+    }
+    return out;
+  }
+
   async function backup(withPhotos) {
     const payload = { format: "lumax-punchlist-backup", version: 1, exported_at: new Date().toISOString(), state: state, photos: [] };
-    if (withPhotos) {
-      const all = await idbAll("photos");
-      for (const p of all) {
-        payload.photos.push({
-          id: p.id, w: p.w, h: p.h, kind: p.kind, caption: p.caption, thumb: p.thumb,
-          created_at: p.created_at, data: await blobToB64(p.blob),
-        });
+    if (!withPhotos) return new Blob([JSON.stringify(payload)], { type: "application/json" });
+    const files = [];
+    const names = new Set();
+    const all = await idbAll("photos");
+    for (const p of all) {
+      const meta = {
+        id: p.id, w: p.w, h: p.h, kind: p.kind, caption: p.caption, thumb: p.thumb,
+        created_at: p.created_at, file: null,
+      };
+      if (p.blob) {
+        // Ids are UUIDs, but one restored from an old file could hold
+        // anything, so keep the path to safe characters and unique.
+        const base = "photos/" + String(p.id).replace(/[^A-Za-z0-9_-]/g, "_");
+        let name = base + ".jpg";
+        for (let n = 2; names.has(name); n++) name = base + "-" + n + ".jpg";
+        names.add(name);
+        meta.file = name;
+        files.push({ name: name, data: p.blob });
       }
+      payload.photos.push(meta);
     }
-    return new Blob([JSON.stringify(payload)], { type: "application/json" });
+    files.unshift({ name: "backup.json", data: new TextEncoder().encode(JSON.stringify(payload)) });
+    return zipBlob(files);
+  }
+
+  /** Read a backup file: a full backup .zip, or a .json (a data-only
+   *  backup, or a full backup from before photos moved into a zip).
+   *  Returns { json, files } where files maps zip paths to Blobs. */
+  async function openBackup(file) {
+    const head = await toBytes(file.slice(0, 4));
+    const isZip = head && head.length === 4 && head[0] === 0x50 && head[1] === 0x4b && head[2] === 3 && head[3] === 4;
+    if (!isZip) return { json: JSON.parse(await file.text()), files: null };
+    const entries = await unzipBlob(file);
+    const main = entries.get("backup.json");
+    if (!main) throw new Error("That .zip is not a Lumax Punch List backup.");
+    const bytes = await toBytes(main.blob);
+    if (DocxKit.crc32(bytes) !== main.crc) throw new Error(ZIP_DAMAGED);
+    const files = new Map();
+    entries.forEach(function (e, name) { files.set(name, e.blob); });
+    return { json: JSON.parse(new TextDecoder().decode(bytes)), files: files };
   }
 
   /** Each phone counts inspection numbers on its own, so a merge can bring
@@ -1264,7 +1422,9 @@ const Store = (function () {
     return renumbered;
   }
 
-  async function restore(json, mode) {
+  /** `files` is the zip's path → Blob map from openBackup(); null for a
+   *  .json backup, whose photos (if any) are base64 inside it. */
+  async function restore(json, mode, files) {
     if (!json || json.format !== "lumax-punchlist-backup") {
       throw new Error("That file is not a Lumax Punch List backup.");
     }
@@ -1276,8 +1436,17 @@ const Store = (function () {
     const photos = (Array.isArray(json.photos) ? json.photos : []).filter(function (p) {
       return isObj(p) && p.id != null && p.id !== "";
     }).map(function (p) {
+      let blob;
+      if (p.file != null && p.file !== "") {
+        // Zip backup: the photo is a slice of the file, stored as it is.
+        const part = files && files.get(String(p.file));
+        if (!part) throw new Error("The backup is missing the photo file " + p.file + ".");
+        blob = part.slice(0, part.size, "image/jpeg");
+      } else {
+        blob = b64ToBlob(p.data, "image/jpeg");
+      }
       return {
-        id: String(p.id), blob: b64ToBlob(p.data, "image/jpeg"),
+        id: String(p.id), blob: blob,
         thumb: typeof p.thumb === "string" && p.thumb.indexOf("data:image/") === 0 ? p.thumb : null,
         w: asNum(p.w), h: asNum(p.h),
         kind: p.kind === "after" || p.kind === "closeout" ? p.kind : "before",
@@ -1360,7 +1529,7 @@ const Store = (function () {
     release: release, onStale: onStale,
     addPhoto: addPhoto, getPhoto: getPhoto, delPhoto: delPhoto,
     photoUrl: photoUrl, photoThumb: photoThumb, photoBytes: photoBytes,
-    backup: backup, restore: restore, usage: usage, orphans: orphans,
+    backup: backup, openBackup: openBackup, restore: restore, usage: usage, orphans: orphans,
     idbAll: idbAll, idbPut: idbPut,
   };
 })();
@@ -2360,7 +2529,7 @@ const UI = (function () {
       '<button class="btn btn-p" data-a="backup" data-v="full">Back up everything (with photos)</button>' +
       '<button class="btn" data-a="backup" data-v="light">Back up data only (small, no photos)</button>' +
       '<button class="btn" data-a="restore">Restore from a backup file…</button>' +
-      '<p class="muted">A backup is one .json file. Email it to yourself or drop it in your project folder — that file is the only copy that survives a lost phone.</p>' +
+      '<p class="muted">A full backup is one .zip file; a data-only backup is a small .json. Email it to yourself or drop it in your project folder — that file is the only copy that survives a lost phone. Restore the file as saved; do not unzip it.</p>' +
       "</div></div>" +
 
       '<div class="card"><div class="card-h"><h2>Company & report</h2></div><div class="card-b">' +
@@ -3274,7 +3443,7 @@ const UI = (function () {
       UI.toast("Preparing backup…", false, 20000);
       try {
         const blob = await Store.backup(withPhotos);
-        const name = "LumaxPunchList_backup_" + today() + (withPhotos ? "_full" : "_data") + ".json";
+        const name = "LumaxPunchList_backup_" + today() + (withPhotos ? "_full.zip" : "_data.json");
         saveBlob(blob, name);
         UI.toast("Backup saved · " + fmtBytes(blob.size));
       } catch (err) {
@@ -3282,13 +3451,13 @@ const UI = (function () {
       }
     },
     "restore": async function () {
-      const files = await pickFile("application/json,.json", false);
+      const files = await pickFile(".json,.zip,application/json,application/zip", false);
       if (!files.length) return;
       if (!confirm("Restore this backup into this device?\n\nCancel stops. Nothing will change.")) return;
       const mode = confirm("OK = replace everything here with the backup (photos it still uses are kept)\nCancel = merge, keeping what is already here") ? "replace" : "merge";
       try {
-        const text = await files[0].text();
-        const res = await Store.restore(JSON.parse(text), mode);
+        const opened = await Store.openBackup(files[0]);
+        const res = await Store.restore(opened.json, mode, opened.files);
         UI.clearUsage();
         App.route = "home"; App.inspId = null;
         UI.render();
