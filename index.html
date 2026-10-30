@@ -634,12 +634,13 @@ const DocxKit = (function () {
 
   function para(content, o) {
     o = o || {};
+    // pPr order is schema-fixed: keepNext, pageBreakBefore, spacing, jc.
     const pr = [];
-    if (o.align) pr.push('<w:jc w:val="' + o.align + '"/>');
-    pr.push('<w:spacing w:after="' + Math.round((o.spaceAfter == null ? 4 : o.spaceAfter) * 20) +
-      '" w:line="240" w:lineRule="auto"/>');
     if (o.keepNext) pr.push("<w:keepNext/>");
     if (o.pageBreakBefore) pr.push("<w:pageBreakBefore/>");
+    pr.push('<w:spacing w:after="' + Math.round((o.spaceAfter == null ? 4 : o.spaceAfter) * 20) +
+      '" w:line="240" w:lineRule="auto"/>');
+    if (o.align) pr.push('<w:jc w:val="' + o.align + '"/>');
     const inner = typeof content === "string" && content.indexOf("<w:r") !== 0
       ? run(content, o) : (content || "");
     return "<w:p><w:pPr>" + pr.join("") + "</w:pPr>" + inner + "</w:p>";
@@ -671,10 +672,12 @@ const DocxKit = (function () {
 
   function row(cells, o) {
     o = o || {};
-    let pr = "";
-    if (o.height) pr = '<w:trPr><w:trHeight w:val="' + mmTwip(o.height) + '" w:hRule="atLeast"/></w:trPr>';
-    if (o.header) pr = "<w:trPr><w:tblHeader/></w:trPr>";
-    return "<w:tr>" + pr + cells.join("") + "</w:tr>";
+    // cantSplit keeps the whole row on one page instead of breaking it across two.
+    const pr = [];
+    if (o.cantSplit) pr.push("<w:cantSplit/>");
+    if (o.height && !o.header) pr.push('<w:trHeight w:val="' + mmTwip(o.height) + '" w:hRule="atLeast"/>');
+    if (o.header) pr.push("<w:tblHeader/>");
+    return "<w:tr>" + (pr.length ? "<w:trPr>" + pr.join("") + "</w:trPr>" : "") + cells.join("") + "</w:tr>";
   }
 
   function table(widths, rows, o) {
@@ -894,6 +897,18 @@ const Store = (function () {
 
   function tx(store, mode) { return db.transaction(store, mode).objectStore(store); }
 
+  // Thumbnails already read, by photo id, so a redraw does not read every
+  // photo record from disk again. Map order is the LRU order: oldest first.
+  const thumbCache = new Map();
+  const THUMB_CACHE_MAX = 600;
+  let thumbGen = 0;               // bumped on every photo write, so a read in flight is not cached
+  /** Any write or delete of a photo record drops its cached thumbnail. */
+  function forgetThumb(store, id) {
+    if (store !== "photos") return;
+    thumbGen++;
+    if (id != null) thumbCache.delete(id);
+  }
+
   function idbGet(store, key) {
     return new Promise(function (res, rej) {
       const r = tx(store, "readonly").get(key);
@@ -902,6 +917,7 @@ const Store = (function () {
     });
   }
   function idbPut(store, value, key) {
+    forgetThumb(store, key === undefined ? value && value.id : key);
     return new Promise(function (res, rej) {
       const r = key === undefined ? tx(store, "readwrite").put(value) : tx(store, "readwrite").put(value, key);
       r.onsuccess = function () { res(true); };
@@ -912,6 +928,7 @@ const Store = (function () {
    *  request can succeed and its transaction still abort (disk full), so a
    *  restore counts a photo as written only after this. */
   function idbPutDone(store, value) {
+    forgetThumb(store, value && value.id);
     return new Promise(function (res, rej) {
       const t = db.transaction(store, "readwrite");
       t.objectStore(store).put(value);
@@ -920,6 +937,7 @@ const Store = (function () {
     });
   }
   function idbDel(store, key) {
+    forgetThumb(store, key);
     return new Promise(function (res, rej) {
       const r = tx(store, "readwrite").delete(key);
       r.onsuccess = function () { res(true); };
@@ -1252,8 +1270,24 @@ const Store = (function () {
     return u;
   }
   async function photoThumb(id) {
+    const hit = cachedThumb(id);
+    if (hit) return hit;
+    const gen = thumbGen;
     const p = await getPhoto(id);
-    return p ? (p.thumb || null) : null;
+    const t = p ? (p.thumb || null) : null;
+    // Cache only if no photo was written or deleted during the read.
+    if (t && gen === thumbGen) {
+      thumbCache.set(id, t);
+      if (thumbCache.size > THUMB_CACHE_MAX) thumbCache.delete(thumbCache.keys().next().value);
+    }
+    return t;
+  }
+  /** The thumbnail if it is already in memory, else null. Never reads disk. */
+  function cachedThumb(id) {
+    if (!id || !thumbCache.has(id)) return null;
+    const t = thumbCache.get(id);
+    thumbCache.delete(id); thumbCache.set(id, t);   // most recently used goes last
+    return t;
   }
   async function photoBytes(id) {
     const p = await getPhoto(id);
@@ -1697,6 +1731,7 @@ const Store = (function () {
     if (mode === "replace") {
       urlCache.forEach(function (u) { URL.revokeObjectURL(u); });
       urlCache.clear();
+      thumbCache.clear(); thumbGen++;
       for (const id of present) {
         if (!keep.has(id)) { try { await idbDel("photos", id); } catch (e) { } }
       }
@@ -1761,7 +1796,7 @@ const Store = (function () {
     load: load, get: get, save: save, flush: flush, blank: blank,
     release: release, onStale: onStale,
     addPhoto: addPhoto, getPhoto: getPhoto, delPhoto: delPhoto,
-    photoUrl: photoUrl, photoThumb: photoThumb, photoBytes: photoBytes, photoIds: photoIds,
+    photoUrl: photoUrl, photoThumb: photoThumb, cachedThumb: cachedThumb, photoBytes: photoBytes, photoIds: photoIds,
     backup: backup, openBackup: openBackup, restore: restore, usage: usage, orphans: orphans,
     idbAll: idbAll, idbPut: idbPut,
   };
@@ -2116,14 +2151,16 @@ const Report = (function () {
     if (snags.length) {
       doc.add(K.pageBreak());
       doc.add(K.text("Problems & Pictures", { size: 13, bold: true, color: NAVY }));
-      const caption = function (p) { return p && p.caption ? K.text(p.caption, { size: 8, align: "center" }) : ""; };
+      const caption = function (p, keep) {
+        return p && p.caption ? K.text(p.caption, { size: 8, align: "center", keepNext: keep }) : "";
+      };
       const pp = [];
       for (let i = 0; i < snags.length; i += 2) {
         const pair = snags.slice(i, i + 2);
         const imgCells = [], txtCells = [];
         for (let j = 0; j < 2; j++) {
           const s = pair[j];
-          if (!s) { imgCells.push(K.cell("", { w: 5040 })); txtCells.push(K.cell("", { w: 5040 })); continue; }
+          if (!s) { imgCells.push(K.cell("", { w: 5040, keepNext: true })); txtCells.push(K.cell("", { w: 5040 })); continue; }
           const shots = await photosFor(s);
           // Close-out and after shots are evidence of the fix and go under
           // "Close-out evidence", so they are not reused as the problem photo,
@@ -2133,8 +2170,10 @@ const Report = (function () {
             shots.find(function (p) { return !isEvidence(p); }) ||
             (mode === "open" ? shots[0] : null) || null;
           const pic = before && doc.picture(before, 78, 62);
-          imgCells.push(K.cell(pic ? K.para(pic, { align: "center" }) + caption(before)
-            : K.text("No photograph", { size: 9, align: "center" }), { w: 5040 }));
+          // keepNext on every paragraph of the photo row holds it on the same
+          // page as the text row below it.
+          imgCells.push(K.cell(pic ? K.para(pic, { align: "center", keepNext: true }) + caption(before, true)
+            : K.text("No photograph", { size: 9, align: "center", keepNext: true }), { w: 5040 }));
 
           const bits = [K.text(s.code + " — " + s.risk, { size: 9, bold: true, color: riskHex(s.risk) })];
           bits.push(K.text(s.description, { size: 9, spaceAfter: 2 }));
@@ -2168,8 +2207,8 @@ const Report = (function () {
           }
           txtCells.push(K.cell(bits.join(""), { w: 5040 }));
         }
-        pp.push(K.row(imgCells));
-        pp.push(K.row(txtCells));
+        pp.push(K.row(imgCells, { cantSplit: true }));
+        pp.push(K.row(txtCells, { cantSplit: true }));
       }
       doc.add(K.table([5040, 5040], pp));
     }
@@ -2917,13 +2956,20 @@ const UI = (function () {
       (t.outstanding ? esc(t.outstanding) + " open" : t.total ? "done" : "empty") + "</span></button>";
   }
 
+  /** src for a thumbnail already in memory, so a redraw shows it at once
+   *  instead of blanking it and reading it from disk again. */
+  function thumbSrc(pid) {
+    const t = Store.cachedThumb(pid);
+    return t ? ' src="' + esc(t) + '" data-loaded="' + esc(pid) + '"' : "";
+  }
+
   /* -------------------------------------------------------------- snags --- */
   function snagRow(s, showCode) {
     const done = DONE.indexOf(s.status) >= 0;
     const loc = [s.block_table, s.support_no ? "Supp " + s.support_no : "", s.location_text]
       .filter(Boolean).join(" · ");
     const thumb = (s.photos || []).length
-      ? '<img class="thumb" data-pid="' + esc(s.photos[0]) + '" alt="" />' : "";
+      ? '<img class="thumb" data-pid="' + esc(s.photos[0]) + '"' + thumbSrc(s.photos[0]) + ' alt="" />' : "";
     return '<button class="rail r-' + esc(s.risk) + (done ? " done" : "") + '" data-a="open-snag" data-id="' + esc(s.id) + '">' +
       thumb +
       '<span class="rh"><span class="num">' + esc(s.snag_number) + "</span>" +
@@ -3279,12 +3325,15 @@ const UI = (function () {
     if (f.start != null) { try { el.setSelectionRange(f.start, f.end); } catch (e) { } }
   }
 
-  /** Fill in photo thumbnails after paint — keeps first render instant. */
-  function hydrate() {
-    document.querySelectorAll("img[data-pid]").forEach(function (img) {
+  /** Fill in photo thumbnails after paint — keeps first render instant.
+   *  root limits the work to one part of the page (the open sheet). */
+  function hydrate(root) {
+    (root || document).querySelectorAll("img[data-pid]").forEach(function (img) {
       const id = img.getAttribute("data-pid");
       if (img.getAttribute("data-loaded") === id) return;
       const wantsThumb = img.classList.contains("thumb") || img.closest(".photocell");
+      const hit = wantsThumb && Store.cachedThumb(id);
+      if (hit) { img.src = hit; img.setAttribute("data-loaded", id); return; }
       const load = wantsThumb
         ? Store.photoThumb(id).then(function (t) { return t || Store.photoUrl(id); })
         : Store.photoUrl(id);
@@ -3312,7 +3361,8 @@ const UI = (function () {
       sheet.scrollTop = scroll;
       refocusField(sheet, typing);
     }
-    hydrate();
+    // The page behind the sheet is already filled in.
+    hydrate(modal);
   }
   function closeModal() {
     document.getElementById("modal").innerHTML = "";
@@ -3329,7 +3379,7 @@ const UI = (function () {
     toast: toast, hideToast: hideToast, render: render, hydrate: hydrate, chrome: chrome,
     openModal: openModal, closeModal: closeModal, sheetHead: sheetHead, setFieldFlush: setFieldFlush,
     field: field, input: input, dateField: dateField, textarea: textarea, select: select, seg: seg,
-    riskTag: riskTag, statusTag: statusTag, snagRow: snagRow, bar: bar,
+    riskTag: riskTag, statusTag: statusTag, snagRow: snagRow, bar: bar, thumbSrc: thumbSrc,
     currentInspection: currentInspection,
     clearUsage: function () { usageCache = null; },
   };
@@ -3425,7 +3475,7 @@ const UI = (function () {
       // The kind label sits beside the photo button, not inside it, so tapping
       // the label only changes the kind and never opens the viewer.
       return '<div class="photocell"><button type="button" class="ph" data-a="view-photo" data-id="' + esc(pid) + '" aria-label="View photo">' +
-        '<img data-pid="' + esc(pid) + '" alt="" /></button>' +
+        '<img data-pid="' + esc(pid) + '"' + UI.thumbSrc(pid) + ' alt="" /></button>' +
         '<button type="button" class="k" data-a="cycle-kind" data-id="' + esc(pid) + '" title="Change photo kind">…</button>' +
         '<button class="x" data-a="del-photo" data-id="' + esc(pid) + '" title="Remove photo">×</button></div>';
     }).join("");
