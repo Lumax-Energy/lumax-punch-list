@@ -297,7 +297,8 @@ textarea.inp{min-height:82px;resize:vertical;line-height:1.4}
   main{padding:16px 20px 40px}
   .tabs{
     position:static;border-top:0;border:1px solid var(--line);border-radius:var(--r);
-    background:var(--surface);box-shadow:var(--shadow);margin-bottom:14px;overflow:hidden;
+    background:var(--surface);box-shadow:var(--shadow);overflow:hidden;
+    width:calc(100% - 40px);max-width:1460px;margin:16px auto 0;
   }
   .tabs button{padding:11px 8px;font-size:12px;border-top:0;border-bottom:3px solid transparent}
   .tabs button.on{border-bottom-color:var(--steel);background:#F4F8FB}
@@ -339,9 +340,9 @@ textarea.inp{min-height:82px;resize:vertical;line-height:1.4}
     <button class="iconbtn" id="btnSun" title="High-contrast mode for sunlight">Sun</button>
     <button class="iconbtn" id="btnHome">Home</button>
   </header>
+  <div id="tabs"></div>
   <main id="view"><div class="empty">Loading…</div></main>
 </div>
-<div id="tabs"></div>
 <div id="fab"></div>
 <div id="modal"></div>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
@@ -376,7 +377,8 @@ const STATUSES = [
 const DONE = ["verified", "closed"];
 // Once a snag is marked fixed (or later), a new photo is evidence of the fix,
 // not of the defect, so it is saved as a close-out photo by default.
-const CLOSEOUT_STATUSES = ["fixed", "pending_verification", "verification_failed", "verified", "closed"];
+// Not verification_failed: a photo taken then shows why it failed.
+const CLOSEOUT_STATUSES = ["fixed", "pending_verification", "verified", "closed"];
 const STATUS_LABEL = {};
 STATUSES.forEach(function (s) { STATUS_LABEL[s.id] = s.label; });
 const STATUS_HEX = {
@@ -1340,7 +1342,13 @@ const Store = (function () {
    *  meanwhile is not in the file, so it must not count as backed up. */
   async function backup(withPhotos) {
     const at = new Date().toISOString();
-    const payload = { format: "lumax-punchlist-backup", version: 1, exported_at: at, state: JSON.parse(JSON.stringify(state)), photos: [] };
+    const copy = JSON.parse(JSON.stringify(state));
+    // A device restored from this file has been backed up at `at`, so the
+    // file carries this backup's own clocks, not the previous backup's.
+    copy.settings.last_backup_at = at;
+    copy.settings.last_backup_full = !!withPhotos;
+    if (withPhotos) copy.settings.last_full_backup_at = at;
+    const payload = { format: "lumax-punchlist-backup", version: 1, exported_at: at, state: copy, photos: [] };
     if (!withPhotos) return { blob: new Blob([JSON.stringify(payload)], { type: "application/json" }), at: at };
     const files = [];
     const names = new Set();
@@ -2220,8 +2228,8 @@ const Report = (function () {
       return String(s || "").replace(/[^\w\s-]/g, "").trim().replace(/\s+/g, "_").slice(0, 40);
     };
     const tag = mode === "open" ? "OpenItems" : mode === "closeout" ? "CloseOut" : "Full";
-    return insp.number + "_" + (safe(project.name) || "PunchList") + "_" + tag +
-      "_Rev" + rev + "_" + (insp.inspection_date || today());
+    return (safe(insp.number) || "Inspection") + "_" + (safe(project.name) || "PunchList") + "_" + tag +
+      "_Rev" + rev + "_" + (safe(insp.inspection_date) || today());
   }
 
   return {
@@ -3138,13 +3146,13 @@ const UI = (function () {
 
   /* ------------------------------------------------------------ photos --- */
   let fileInput = null;
-  function pickFile(accept, useCamera) {
+  function pickFile(accept, useCamera, single) {
     return new Promise(function (res) {
       if (fileInput) fileInput.remove();
       fileInput = document.createElement("input");
       fileInput.type = "file";
       fileInput.accept = accept || "image/*";
-      fileInput.multiple = !useCamera;
+      fileInput.multiple = !useCamera && !single;
       if (useCamera) fileInput.setAttribute("capture", "environment");
       fileInput.style.display = "none";
       let settled = false;
@@ -3791,7 +3799,7 @@ const UI = (function () {
     },
     "hide-backup-nag": function () { App.backupNagHidden = true; UI.render(); },
     "restore": async function () {
-      const files = await pickFile(".json,.zip,application/json,application/zip", false);
+      const files = await pickFile(".json,.zip,application/json,application/zip", false, true);
       if (!files.length) return;
       if (!confirm("Restore this backup into this device?\n\nCancel stops. Nothing will change.")) return;
       const mode = confirm("OK = replace everything here with the backup (photos it still uses are kept)\nCancel = merge, keeping what is already here") ? "replace" : "merge";
