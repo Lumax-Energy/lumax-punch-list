@@ -219,6 +219,9 @@ textarea.inp{min-height:82px;resize:vertical;line-height:1.4}
   -webkit-appearance:none;appearance:none;text-align:left}
 .ph:focus-visible{outline:3px solid #7FB3D0;outline-offset:-3px}
 .photocell .k:focus-visible{outline:3px solid #7FB3D0;outline-offset:1px}
+/* Stands in for a photo listed on the snag but not stored on this device. */
+.ph-gone{height:104px;display:flex;align-items:center;justify-content:center;text-align:center;
+  padding:34px 8px 8px;font-size:12px;font-weight:700;line-height:1.25;color:var(--ink-3)}
 .photocell .x{
   position:absolute;right:3px;top:3px;width:34px;height:34px;border-radius:17px;border:0;
   background:rgba(180,35,24,.92);color:#fff;font-size:15px;line-height:1;font-weight:700;
@@ -1211,6 +1214,9 @@ const Store = (function () {
     if (!bytes) return null;
     return { bytes: bytes, ext: "jpeg", w: p.w, h: p.h, caption: p.caption, kind: p.kind };
   }
+  /** Ids of every photo stored on this device. Reads keys only, never the
+   *  photos themselves, so it is cheap enough to run on each render. */
+  function photoIds() { return idbKeys("photos"); }
 
   /* ------------------------------------------------------- backup/restore -- */
   /* A full backup is a store-only .zip: backup.json (the data, with photo
@@ -1669,7 +1675,7 @@ const Store = (function () {
     load: load, get: get, save: save, flush: flush, blank: blank,
     release: release, onStale: onStale,
     addPhoto: addPhoto, getPhoto: getPhoto, delPhoto: delPhoto,
-    photoUrl: photoUrl, photoThumb: photoThumb, photoBytes: photoBytes,
+    photoUrl: photoUrl, photoThumb: photoThumb, photoBytes: photoBytes, photoIds: photoIds,
     backup: backup, openBackup: openBackup, restore: restore, usage: usage, orphans: orphans,
     idbAll: idbAll, idbPut: idbPut,
   };
@@ -2217,10 +2223,25 @@ const Report = (function () {
       noDesc.length ? noDesc.length + " snags have no description" : "Every snag has a description",
       noDesc.length ? "Snags " + noDesc.map(function (s) { return s.snag_number; }).join(", ") : "");
 
-    const noPhoto = snags.filter(function (s) { return !(s.photos || []).length; });
+    // A snag whose photos are all missing here prints "No photograph" too.
+    const noPhoto = snags.filter(function (s) { return !keptPhotos(s).length; });
     add(noPhoto.length ? "warn" : "pass",
       noPhoto.length ? noPhoto.length + " snags have no photograph" : "Every snag has a photograph",
       noPhoto.length ? "Snags " + noPhoto.map(function (s) { return s.snag_number; }).join(", ") : "");
+
+    // Photo ids come back with a data-only restore, the photos do not.
+    // This reads the cache refreshPhotos() fills.
+    const allIds = photoIdsOf(insp);
+    const gone = [];
+    snags.forEach(function (s) {
+      (s.photos || []).forEach(function (id) { if (photoMissing(id) && gone.indexOf(id) < 0) gone.push(id); });
+    });
+    if (allIds.some(function (id) { return !onDevice.has(id); })) {
+      add("wait", "Checking the photos are on this device…", "");
+    } else if (gone.length) {
+      add("warn", (gone.length === 1 ? "1 photo is" : gone.length + " photos are") + " not on this device",
+        "Restore the full backup (…_full.zip) before exporting, or the report prints “No photograph” in their place.");
+    }
 
     const noAction = snags.filter(function (s) { return !(s.required_action || "").trim(); });
     add(noAction.length ? "warn" : "pass",
@@ -2244,11 +2265,18 @@ const Report = (function () {
     }
 
     const pinned = snags.filter(function (s) { return s.pin_x != null; });
-    add(insp.site_plan_id ? "pass" : "warn",
-      insp.site_plan_id ? "Site plan loaded, " + pinned.length + " of " + snags.length + " snags pinned"
-        : "No site plan image", "The Site Top View page will use a plain grid.");
-    add(insp.site_photo_id ? "pass" : "warn",
-      insp.site_photo_id ? "Cover photo set" : "No site cover photo", "Page 1 will have no site shot.");
+    // A plan or cover whose photo is not stored here is missing from the report too.
+    const planHere = insp.site_plan_id && !photoMissing(insp.site_plan_id);
+    add(planHere ? "pass" : "warn",
+      planHere ? "Site plan loaded, " + pinned.length + " of " + snags.length + " snags pinned"
+        : insp.site_plan_id ? "Site plan image is not on this device" : "No site plan image",
+      "The Site Top View page will use a plain grid." +
+      (insp.site_plan_id ? " Restore the full backup (…_full.zip) to bring it back." : ""));
+    const coverHere = insp.site_photo_id && !photoMissing(insp.site_photo_id);
+    add(coverHere ? "pass" : "warn",
+      coverHere ? "Cover photo set" : insp.site_photo_id ? "Site cover photo is not on this device" : "No site cover photo",
+      "Page 1 will have no site shot." +
+      (insp.site_photo_id ? " Restore the full backup (…_full.zip) to bring it back." : ""));
 
     const t = tally(snags);
     if (t.outstanding) add("warn", t.outstanding + " items still open (" + t.hrOpen + " high risk)",
@@ -2263,10 +2291,53 @@ const Report = (function () {
    * it is derived from the photo records and must never be saved. */
   const evidence = new Map();
 
-  /** Re-read photo kinds for the verified snags. Resolves true only when an
-   *  answer changed, so the caller re-renders once and then stops. */
-  async function refreshEvidence(insp) {
+  /* Photo id -> stored on this device. A data-only restore keeps the photo
+   * ids on each snag but brings no photos, so this is checked, never
+   * assumed. Also kept out of state: it describes this phone, not the job. */
+  const onDevice = new Map();
+
+  function photoIdsOf(insp) {
+    const ids = [];
+    const push = function (id) { if (id && ids.indexOf(id) < 0) ids.push(id); };
+    push(insp.site_plan_id);
+    push(insp.site_photo_id);
+    snagsOf(insp.id).forEach(function (s) { (s.photos || []).forEach(push); });
+    return ids;
+  }
+
+  /** True only once a check has found the photo is not stored here. */
+  function photoMissing(id) { return onDevice.get(id) === false; }
+
+  /** The snag's photos less any known to be missing on this device. */
+  function keptPhotos(s) {
+    return (s.photos || []).filter(function (id) { return !photoMissing(id); });
+  }
+
+  /** Check which of the inspection's photos are stored here. Resolves true
+   *  only when a photo is found missing or comes back, so the snag list
+   *  re-renders once and then stops (an unchecked photo counts as present). */
+  async function refreshPhotos(insp) {
+    const ids = photoIdsOf(insp);
+    if (!ids.length) return false;
+    const stored = new Set(await Store.photoIds());
     let changed = false;
+    ids.forEach(function (id) {
+      const has = stored.has(id);
+      const was = onDevice.get(id);
+      if (was === has) return;
+      onDevice.set(id, has);
+      if (!has || was === false) changed = true;
+    });
+    return changed;
+  }
+
+  /** Re-read photo kinds for the verified snags, and which photos are on
+   *  this device. Resolves true only when an answer changed, so the caller
+   *  re-renders once and then stops. */
+  async function refreshEvidence(insp) {
+    // Pre-flight shows "Checking…" until every photo has been looked up once.
+    const unchecked = photoIdsOf(insp).some(function (id) { return !onDevice.has(id); });
+    let changed = (await refreshPhotos(insp)) || unchecked;
     for (const s of snagsOf(insp.id)) {
       if (DONE.indexOf(s.status) < 0) continue;
       let has = false;
@@ -2291,6 +2362,7 @@ const Report = (function () {
 
   return {
     buildDocx: buildDocx, buildCsv: buildCsv, preflight: preflight, refreshEvidence: refreshEvidence,
+    refreshPhotos: refreshPhotos, photoMissing: photoMissing, keptPhotos: keptPhotos,
     renderMap: renderMap, fileBase: fileBase, filterSnags: filterSnags,
   };
 })();
@@ -2648,9 +2720,14 @@ const UI = (function () {
       if (f === "hr") return s.risk === "HR" && DONE.indexOf(s.status) < 0;
       if (f === "done") return DONE.indexOf(s.status) >= 0;
       if (f === "overdue") return isOverdue(s);
-      if (f === "nophoto") return !(s.photos || []).length;
+      if (f === "nophoto") return !Report.keptPhotos(s).length;
       return true;
     });
+    // Photos listed on a snag may not be stored here (a data-only restore),
+    // so check after paint and redraw only if one went missing or came back.
+    Report.refreshPhotos(insp).then(function (changed) {
+      if (changed && App.route === "inspection" && App.tab === "snags" && App.inspId === insp.id) render();
+    }).catch(function (err) { console.error(err); });
     const chips = [["all", "All " + t.total], ["open", "Open " + t.outstanding], ["hr", "HR open " + t.hrOpen],
     ["overdue", "Overdue " + t.overdue], ["done", "Done " + t.done], ["nophoto", "No photo"]];
 
@@ -3061,6 +3138,7 @@ const UI = (function () {
       : " Tap the label on a photo to switch it between Before, After and Close-out.";
 
     const photos =(s.photos || []).map(function (pid) {
+      if (Report.photoMissing(pid)) return '<div class="photocell">' + missingPhotoCell(pid) + "</div>";
       // The kind label sits beside the photo button, not inside it, so tapping
       // the label only changes the kind and never opens the viewer.
       return '<div class="photocell"><button type="button" class="ph" data-a="view-photo" data-id="' + esc(pid) + '" aria-label="View photo">' +
@@ -3147,13 +3225,21 @@ const UI = (function () {
       '<p class="muted" style="margin-top:10px">' + esc(s.code) + "</p>" +
       "</div>");
 
-    // Show each photo's kind label.
+    // Show each photo's kind label, or say so when the photo is not stored here.
     (s.photos || []).forEach(function (pid) {
       Store.getPhoto(pid).then(function (p) {
         const el = document.querySelector('.k[data-id="' + CSS.escape(pid) + '"]');
         if (el && p) el.textContent = p.kind === "closeout" ? "Close-out" : p.kind === "after" ? "After" : "Before";
+        else if (el && !p) el.closest(".photocell").innerHTML = missingPhotoCell(pid);
       });
     });
+  }
+
+  // A data-only restore keeps a snag's photo ids but not the photos, so say
+  // so instead of showing a blank tile. The × still removes the reference.
+  function missingPhotoCell(pid) {
+    return '<div class="ph-gone">Photo not on this device</div>' +
+      '<button class="x" data-a="del-photo" data-id="' + esc(pid) + '" title="Remove photo">×</button>';
   }
 
   function templateSheet(id) {
