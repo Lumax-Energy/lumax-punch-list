@@ -373,6 +373,9 @@ const STATUSES = [
   { id: "closed", label: "Closed", short: "Closed" },
 ];
 const DONE = ["verified", "closed"];
+// Once a snag is marked fixed (or later), a new photo is evidence of the fix,
+// not of the defect, so it is saved as a close-out photo by default.
+const CLOSEOUT_STATUSES = ["fixed", "pending_verification", "verification_failed", "verified", "closed"];
 const STATUS_LABEL = {};
 STATUSES.forEach(function (s) { STATUS_LABEL[s.id] = s.label; });
 const STATUS_HEX = {
@@ -2848,8 +2851,13 @@ const UI = (function () {
     App.snagId = id;
     const st = Store.get();
     const done = DONE.indexOf(s.status) >= 0;
+    // Tell the user up front when new photos will not be saved as Before.
+    const kindNote = newPhotoKind(s) === "closeout"
+      ? '<span style="display:block;margin-top:4px">New photos are saved as Close-out (status is ' +
+        esc(STATUS_LABEL[s.status] || s.status) + "). Tap a photo's label to change it.</span>"
+      : " Tap the label on a photo to switch it between Before, After and Close-out.";
 
-    const photos = (s.photos || []).map(function (pid) {
+    const photos =(s.photos || []).map(function (pid) {
       // The kind label sits beside the photo button, not inside it, so tapping
       // the label only changes the kind and never opens the viewer.
       return '<div class="photocell"><button type="button" class="ph" data-a="view-photo" data-id="' + esc(pid) + '" aria-label="View photo">' +
@@ -2889,7 +2897,7 @@ const UI = (function () {
       '<div class="photogrid" style="margin-bottom:10px">' + photos +
       '<button class="dropzone" data-a="pick-photo" data-v="snag" style="min-height:104px">Library</button>' +
       '<button class="dropzone" data-a="take-photo" data-v="snag" style="min-height:104px">Camera</button></div>' +
-      '<p class="muted" style="margin:-4px 0 12px">Library picks from the phone. Camera opens the camera. Tap the label on a photo to switch it between Before, After and Close-out.</p>' +
+      '<p class="muted" style="margin:-4px 0 12px">Library picks from the phone. Camera opens the camera.' + kindNote + "</p>" +
 
       '<div class="btn-row" style="margin-bottom:12px">' + statusBtns + "</div>" +
 
@@ -3031,6 +3039,11 @@ const UI = (function () {
     });
   }
 
+  // The kind a new snag photo gets: Close-out once the snag is fixed or later.
+  function newPhotoKind(s) {
+    return s && CLOSEOUT_STATUSES.indexOf(s.status) >= 0 ? "closeout" : "before";
+  }
+
   async function addPhotos(target, kindHint, useCamera) {
     const files = await pickFile("image/*", !!useCamera);
     if (!files.length) return;
@@ -3039,9 +3052,13 @@ const UI = (function () {
     // Decide the snag now: the user may close this sheet or open another one
     // while the photos are still being processed.
     const snag = target === "snag" && App.modal && App.modal.type === "snag" ? snagById(App.modal.id) : null;
+    // Snag photos take their kind from the snag's status, decided once so a
+    // batch never ends up split across two kinds.
+    const kind = snag ? newPhotoKind(snag) : kindHint || "before";
+    let added = 0, failed = 0;
     for (const f of files) {
       try {
-        const rec = await Store.addPhoto(f, { kind: kindHint || "before" });
+        const rec = await Store.addPhoto(f, { kind: kind });
         if (target === "site") {
           if (i.site_photo_id) await Store.delPhoto(i.site_photo_id);
           i.site_photo_id = rec.id;
@@ -3051,8 +3068,10 @@ const UI = (function () {
         } else if (snag) {
           snag.photos.push(rec.id);
           snag.updated_at = new Date().toISOString();
+          added++;
         }
       } catch (err) {
+        failed++;
         UI.toast(err.message || "That photo could not be added", true, 5000);
       }
     }
@@ -3060,6 +3079,10 @@ const UI = (function () {
     UI.clearUsage();
     if (snag && App.modal && App.modal.type === "snag" && App.modal.id === snag.id) snagSheet(snag.id);
     UI.render();
+    // Say which kind the photos were saved as. Leave an error toast showing.
+    if (added && !failed) {
+      UI.toast(added + " " + (kind === "closeout" ? "close-out" : "before") + " photo" + (added > 1 ? "s" : "") + " added");
+    }
   }
 
   function parseCoords(text) {
@@ -3426,13 +3449,14 @@ const UI = (function () {
       UI.toast("Pin placed for snag " + s.snag_number);
     },
 
+    // For a snag, addPhotos picks the kind from the snag's status.
     "pick-photo": function (el) {
       const v = el.getAttribute("data-v");
-      addPhotos(v, v === "snag" ? "before" : v, false);
+      addPhotos(v, v === "snag" ? "" : v, false);
     },
     "take-photo": function (el) {
       const v = el.getAttribute("data-v");
-      addPhotos(v, v === "snag" ? "before" : v, true);
+      addPhotos(v, v === "snag" ? "" : v, true);
     },
     "clear-photo": function (el) {
       const i = insp(), which = el.getAttribute("data-v");
