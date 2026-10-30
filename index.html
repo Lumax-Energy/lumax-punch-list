@@ -10,6 +10,9 @@
 <meta name="apple-mobile-web-app-title" content="Lumax Punch List" />
 <meta name="color-scheme" content="light" />
 <title>Lumax Punch List</title>
+<link rel="manifest" href="manifest.webmanifest" />
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png" />
+<link rel="apple-touch-icon" href="apple-touch-icon.png" />
 <style>
 /* ── tokens ───────────────────────────────────────────────────────────────
    Screen colours are the report colours. A pin that is red on the plan is
@@ -2483,6 +2486,18 @@ const UI = (function () {
       '<button class="btn btn-xs" data-a="hide-backup-nag" aria-label="Hide this reminder">✕</button></div>';
   }
 
+  /** How to get the app onto a phone. A downloaded file (file://) and the
+   *  hosted page (https, with the service worker) need different advice. */
+  function phoneHelp() {
+    if (location.protocol === "file:") {
+      return "Android: open this file in Chrome. iPhone: Chrome cannot open a downloaded HTML file — in Files, tap the file and open it in Safari. GPS on a downloaded file is blocked in Chrome; use Safari or Enter coordinates. Pin on the plan always works.";
+    }
+    if (!("serviceWorker" in navigator) || !window.isSecureContext) {
+      return "This browser cannot keep a copy of the app, so it needs signal to open. Your inspections are still stored on this device. Pin on the plan always works.";
+    }
+    return "Works with no signal after the first visit. Add it to your home screen: Android Chrome menu ⋮ → Add to Home screen; iPhone Safari Share → Add to Home Screen. Pin on the plan always works.";
+  }
+
   /* --------------------------------------------------------------- home --- */
   function viewHome() {
     const st = Store.get();
@@ -2536,7 +2551,7 @@ const UI = (function () {
       '<button class="btn" data-a="go-settings">Settings & data</button>' +
       "</div>" +
       '<p class="muted" style="text-align:center;margin:4px 0 0">Everything is stored on this device. Back up from Settings.</p>' +
-      '<div class="banner info"><span>i</span><span><b>On your phone</b>Android: open this file in Chrome. iPhone: Chrome cannot open a downloaded HTML file — in Files, tap the file and open it in Safari. GPS on a downloaded file is blocked in Chrome; use Safari or Enter coordinates. Pin on the plan always works.</span></div>' +
+      '<div class="banner info"><span>i</span><span><b>On your phone</b>' + esc(phoneHelp()) + "</span></div>" +
       "</div>";
   }
 
@@ -2794,7 +2809,7 @@ const UI = (function () {
       "</div></div>" +
 
       '<div class="card"><div class="card-h"><h2>Open on a phone</h2></div><div class="card-b">' +
-      '<p>Android: open this file in Chrome. iPhone: Chrome cannot open a downloaded HTML file — in Files, tap the file and open it in Safari. GPS on a downloaded file is blocked in Chrome; use Safari or Enter coordinates. Pin on the plan always works.</p>' +
+      "<p>" + esc(phoneHelp()) + "</p>" +
       "</div></div>" +
 
       '<div class="card"><div class="card-h"><h2>Backup & restore</h2></div><div class="card-b stack">' +
@@ -3253,7 +3268,10 @@ const UI = (function () {
       '<div class="btn-row">' +
       '<button class="btn btn-p" data-a="gps-save">Save coordinates</button>' +
       '<button class="btn" data-a="back-to-snag">Back to snag</button></div>' +
-      '<p class="muted" style="margin-top:12px">Allowing Location for Chrome is not enough if you opened this file from Downloads. Chrome still blocks live GPS on file://. Paste from Google Maps (share → copy coordinates) or place a pin on the plan.</p>' +
+      '<p class="muted" style="margin-top:12px">' + (location.protocol === "file:"
+        ? "Allowing Location for Chrome is not enough if you opened this file from Downloads. Chrome still blocks live GPS on file://. "
+        : "If the phone will not give a position, allow Location for this site (lock icon near the address). ") +
+      "Paste from Google Maps (share → copy coordinates) or place a pin on the plan.</p>" +
       "</div>"
     );
   }
@@ -4037,10 +4055,18 @@ const UI = (function () {
   /* --------------------------------------------------------------- boot -- */
   async function boot() {
     // Reachable from the Chrome console for support: Lumax.Store.get()
+    // When the version changes, change CACHE in sw.js to match.
     window.Lumax = {
       Store: Store, UI: UI, App: App, Report: Report, Model: Model, DocxKit: DocxKit,
       snagsOf: snagsOf, actions: actions, version: "2.0.4",
     };
+    // Keeps a copy of the app so the home-screen icon opens with no signal.
+    // A downloaded file cannot have one; a failure here must not stop the app.
+    if ("serviceWorker" in navigator && location.protocol !== "file:") {
+      try {
+        navigator.serviceWorker.register("sw.js").catch(function (e) { console.warn("Offline copy not set up:", e); });
+      } catch (e) { }
+    }
     document.getElementById("brandmark").src = "data:image/png;base64," + LUMAX_LOGO_B64;
     document.getElementById("btnHome").addEventListener("click", function () {
       App.route = "home"; App.inspId = null; App.placing = false; App.pinFor = null;

@@ -1,0 +1,16 @@
+{
+  "name": "Lumax Punch List",
+  "short_name": "Punch List",
+  "description": "Log site snags with photos, plan pins and Word reports. Works offline; data stays on this device.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "theme_color": "#0F304A",
+  "background_color": "#EEF2F6",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
