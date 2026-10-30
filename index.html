@@ -1169,7 +1169,9 @@ const Store = (function () {
         const th = Math.max(1, Math.round(h * Math.min(1, 360 / Math.max(w, h))));
         const tc = document.createElement("canvas");
         tc.width = tw; tc.height = th;
-        tc.getContext("2d").drawImage(src, 0, 0, tw, th);
+        // Draw from the white-filled canvas: JPEG has no alpha, so a
+        // transparent PNG drawn straight from src would turn black.
+        tc.getContext("2d").drawImage(c, 0, 0, tw, th);
         c.toBlob(function (blob) {
           if (!blob) return rej(new Error("This image could not be read."));
           res({ blob: blob, w: w, h: h, thumb: tc.toDataURL("image/jpeg", 0.62) });
@@ -2537,10 +2539,20 @@ const Report = (function () {
     return changed;
   }
 
+  // Everything but letters (with their accents), digits, spaces, _ and -.
+  // Browsers without \p{} support strip ASCII punctuation and control codes
+  // instead, which still keeps non-Latin letters.
+  const FILE_UNSAFE_RE = (function () {
+    try { return new RegExp("[^\\p{L}\\p{M}\\p{N}\\s_-]", "gu"); } catch (e) { }
+    return /[\x00-\x1f\x7f-\x9f!-,.\/:-@\[-\^`{-~]/g;
+  })();
+
   function fileBase(insp, mode, rev) {
     const project = projectOf(insp);
+    // Keep accented and non-Latin letters ("Café" stays "Café"); drop only
+    // punctuation, path and reserved characters (\/:*?"<>|) and control codes.
     const safe = function (s) {
-      return String(s || "").replace(/[^\w\s-]/g, "").trim().replace(/\s+/g, "_").slice(0, 40);
+      return Array.from(String(s || "").replace(FILE_UNSAFE_RE, "").trim().replace(/\s+/g, "_")).slice(0, 40).join("");
     };
     const tag = mode === "open" ? "OpenItems" : mode === "closeout" ? "CloseOut" : "Full";
     return (safe(insp.number) || "Inspection") + "_" + (safe(project.name) || "PunchList") + "_" + tag +
@@ -2554,12 +2566,22 @@ const Report = (function () {
   };
 })();
 
+// iPhone Safari reads the blob only after the user taps Download at its
+// prompt, so the URL must outlive a slow tap. Keep just the latest one alive
+// (a new download frees the old) and drop it after a minute or on leaving.
+let savedBlobUrl = null;
+function revokeSavedBlob() {
+  if (savedBlobUrl) { URL.revokeObjectURL(savedBlobUrl); savedBlobUrl = null; }
+}
+window.addEventListener("pagehide", revokeSavedBlob);
 function saveBlob(blob, filename) {
+  revokeSavedBlob();
   const url = URL.createObjectURL(blob);
+  savedBlobUrl = url;
   const a = document.createElement("a");
   a.href = url; a.download = filename; a.rel = "noopener";
   document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+  setTimeout(function () { if (savedBlobUrl === url) revokeSavedBlob(); }, 60000);
 }
 
 // A shared file needs a plain MIME type: Chrome refuses "text/csv;charset=…",
@@ -3579,7 +3601,9 @@ const UI = (function () {
   }
 
   async function addPhotos(target, kindHint, useCamera) {
-    const files = await pickFile("image/*", !!useCamera);
+    // The site cover and plan hold one image each, so ask for one file only.
+    const single = target === "site" || target === "plan";
+    const files = (await pickFile("image/*", !!useCamera, single)).slice(0, single ? 1 : undefined);
     if (!files.length) return;
     UI.toast("Processing " + files.length + " photo" + (files.length > 1 ? "s" : "") + "…");
     const i = insp();
