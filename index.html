@@ -21,7 +21,7 @@
   --navy:#0F304A; --steel:#156082; --steel-dk:#0E4560;
   --hr:#B42318; --lr:#B54708; --ok:#027A48; --pend:#156082;
   --paper:#EEF2F6; --surface:#FFFFFF; --band:#E8EDF2; --line:#C9D4DE;
-  --ink:#12212E; --ink-2:#3D5567; --ink-3:#6B7F8F;
+  --ink:#12212E; --ink-2:#3D5567; --ink-3:#576B7B;
   --rail:6px; --tap:46px; --r:10px;
   --shadow:0 1px 2px rgba(15,48,74,.10), 0 6px 18px -8px rgba(15,48,74,.28);
   --mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
@@ -345,7 +345,7 @@ textarea.inp{min-height:82px;resize:vertical;line-height:1.4}
       <b id="whereTitle">Lumax Punch List</b>
       <span id="whereSub">Loading…</span>
     </div>
-    <button class="iconbtn" id="btnSun" title="High-contrast mode for sunlight">Sun</button>
+    <button class="iconbtn" id="btnSun" title="High-contrast mode for sunlight" aria-pressed="false">Sun</button>
     <button class="iconbtn" id="btnHome">Home</button>
   </header>
   <div id="tabs"></div>
@@ -2736,7 +2736,9 @@ const UI = (function () {
   function seg(name, value, options, cls) {
     return '<div class="seg ' + esc(cls || "") + '" data-seg="' + esc(name) + '">' + options.map(function (o) {
       const v = Array.isArray(o) ? o[0] : o, l = Array.isArray(o) ? o[1] : o;
-      return '<button type="button" data-v="' + esc(v) + '" class="' + (String(value) === String(v) ? "on" : "") + '">' + esc(l) + "</button>";
+      const on = String(value) === String(v);
+      // aria-pressed so a screen reader says which one is chosen, not just the colour.
+      return '<button type="button" data-v="' + esc(v) + '" class="' + (on ? "on" : "") + '" aria-pressed="' + on + '">' + esc(l) + "</button>";
     }).join("") + "</div>";
   }
 
@@ -2765,7 +2767,8 @@ const UI = (function () {
       const items = [["snags", "Snags", t.total], ["plan", "Plan", ""], ["info", "Info", ""], ["report", "Report", ""]];
       tabs.className = "tabs";
       tabs.innerHTML = items.map(function (i) {
-        return '<button data-a="tab" data-v="' + esc(i[0]) + '" class="' + (App.tab === i[0] ? "on" : "") + '">' +
+        return '<button data-a="tab" data-v="' + esc(i[0]) + '" class="' + (App.tab === i[0] ? "on" : "") + '"' +
+          (App.tab === i[0] ? ' aria-current="page"' : "") + ">" +
           (i[2] !== "" ? '<span class="n">' + esc(i[2]) + "</span>" : "") + esc(i[1]) + "</button>";
       }).join("");
       fab.innerHTML = App.tab === "snags"
@@ -2890,7 +2893,7 @@ const UI = (function () {
 
     return '<div class="stack">' + backupNag() +
       '<div class="card"><div class="card-b" style="padding:10px">' +
-      '<input class="inp" id="q" placeholder="Search all snags — code, description, table" value="' + esc(App.query) + '" />' +
+      '<input class="inp" id="q" aria-label="Search all snags" placeholder="Search all snags — code, description, table" value="' + esc(App.query) + '" />' +
       "</div></div>" + hits +
       (projects.length ? list :
         '<div class="card"><div class="empty"><b>No projects yet</b>Create a project, then an inspection, then start adding snags.</div></div>') +
@@ -2961,7 +2964,7 @@ const UI = (function () {
     const last = all[all.length - 1];
     return '<div class="stack">' +
       '<div class="scroller">' + chips.map(function (c) {
-        return '<button class="chip' + (f === c[0] ? " on" : "") + '" data-a="filter" data-v="' + esc(c[0]) + '">' + esc(c[1]) + "</button>";
+        return '<button class="chip' + (f === c[0] ? " on" : "") + '" aria-pressed="' + (f === c[0]) + '" data-a="filter" data-v="' + esc(c[0]) + '">' + esc(c[1]) + "</button>";
       }).join("") + "</div>" +
       (all.length ? '<div class="card"><div class="card-b" style="padding:10px">' + bar(t) + "</div></div>" : "") +
       '<div class="btn-row">' +
@@ -3382,7 +3385,7 @@ const UI = (function () {
     const list = st.templates.filter(function (t) { return t.active !== false; });
     UI.openModal(UI.sheetHead("Add snag") +
       '<div class="sheet-b">' +
-      '<input class="inp" id="tplq" placeholder="Filter templates" style="margin-bottom:10px" />' +
+      '<input class="inp" id="tplq" aria-label="Filter templates" placeholder="Filter templates" style="margin-bottom:10px" />' +
       '<button class="btn btn-n" data-a="create-snag" data-id="" style="width:100%;margin-bottom:10px">Blank snag</button>' +
       '<div id="tpllist">' + list.map(function (t) {
         return '<button class="rail r-' + esc(t.risk) + '" data-a="create-snag" data-id="' + esc(t.id) + '" data-label="' +
@@ -4515,8 +4518,9 @@ const UI = (function () {
     const b = ev.target.closest(".seg button");
     if (!b) return;
     const seg = b.closest(".seg");
-    seg.querySelectorAll("button").forEach(function (x) { x.classList.remove("on"); });
+    seg.querySelectorAll("button").forEach(function (x) { x.classList.remove("on"); x.setAttribute("aria-pressed", "false"); });
     b.classList.add("on");
+    b.setAttribute("aria-pressed", "true");
     applyField(seg.getAttribute("data-seg"), b.getAttribute("data-v"));
     if (seg.getAttribute("data-seg") === "risk") {
       UI.render();
@@ -4526,7 +4530,11 @@ const UI = (function () {
   });
 
   document.addEventListener("keydown", function (ev) {
-    if (ev.key === "Escape" && App.modal) { flushPendingField(); UI.closeModal(); UI.render(); }
+    // Any open sheet, not just App.modal ones: the Add-snag, remark and Info
+    // date pickers open without it. Same as tapping Close.
+    if (ev.key === "Escape" && (App.modal || document.getElementById("modal").firstChild)) {
+      flushPendingField(); UI.closeModal(); UI.render();
+    }
   });
 
   // Save typed text too, not just the debounced state. Phones often kill a
@@ -4621,10 +4629,15 @@ const UI = (function () {
       UI.closeModal(); UI.render();
     });
     const sun = document.getElementById("btnSun");
-    if (localStorage.getItem("lumax-sun") === "1") { document.body.classList.add("sun"); sun.classList.add("on"); }
+    // A browser that blocks site data throws on any localStorage use; that
+    // must not stop boot before the storage-blocked banner below can show.
+    let sunOn = false;
+    try { sunOn = localStorage.getItem("lumax-sun") === "1"; } catch (e) { }
+    if (sunOn) { document.body.classList.add("sun"); sun.classList.add("on"); sun.setAttribute("aria-pressed", "true"); }
     sun.addEventListener("click", function () {
       const on = document.body.classList.toggle("sun");
       sun.classList.toggle("on", on);
+      sun.setAttribute("aria-pressed", String(on));
       try { localStorage.setItem("lumax-sun", on ? "1" : "0"); } catch (e) { }
     });
 
