@@ -238,6 +238,8 @@ textarea.inp{min-height:82px;resize:vertical;line-height:1.4}
 .planwrap.placing{outline:3px solid var(--steel);outline-offset:-3px;cursor:crosshair}
 /* Touch screens show no cursor, and iOS needs a pointer one to send the tap. */
 @media (hover:none){.planwrap.placing{cursor:pointer}}
+/* While placing, a tap on or beside an existing pin must reach the plan, so nearby defects can be pinned. */
+.planwrap.placing .pin{pointer-events:none}
 .pin{
   position:absolute;transform:translate(-50%,-50%);width:28px;height:28px;border-radius:14px;
   border:2.5px solid #fff;color:#fff;font-family:var(--mono);font-size:12px;font-weight:700;
@@ -993,6 +995,11 @@ const Store = (function () {
     return Array.isArray(a) ? a.filter(function (x) { return x != null && x !== ""; }).map(String) : [];
   }
   function asRisk(r) { return r === "LR" ? "LR" : "HR"; }
+  // Older builds could save a late keystroke as a stray "gps.lng" or "p.name"
+  // field. Real fields never contain a dot, so these are junk.
+  function dropDottedKeys(o) {
+    Object.keys(o).forEach(function (k) { if (k.indexOf(".") >= 0) delete o[k]; });
+  }
 
   /** Forward-only migration. Old records must keep working. */
   function migrate(s) {
@@ -1038,6 +1045,7 @@ const Store = (function () {
       if (sn.lat == null || sn.lng == null) { sn.lat = null; sn.lng = null; }
       // Older builds saved a transient photo-kind list on each snag; it was never real data.
       delete sn._kinds;
+      dropDottedKeys(sn);
     });
     out.inspections.forEach(function (i) {
       asText(i, ["id", "number", "project_id", "area", "type", "inspection_date", "next_inspection_date",
@@ -1049,6 +1057,7 @@ const Store = (function () {
       if (i.technical_notes == null) i.technical_notes = "";
       i.rev = asNum(i.rev) || 0;
       if (i.last_snag_number != null) i.last_snag_number = asNum(i.last_snag_number);
+      dropDottedKeys(i);
     });
     out.revisions.forEach(function (r) {
       asText(r, ["id", "inspection_id", "reason", "by", "created_at"]);
@@ -2843,10 +2852,14 @@ const UI = (function () {
       const found = st.snags.filter(function (s) {
         return (s.code + " " + (s.previous_codes || []).join(" ") + " " + s.description + " " + s.block_table + " " + s.location_text +
           " " + s.required_action).toLowerCase().indexOf(q) >= 0;
-      }).slice(0, 40);
+      });
+      // Count every match, but only draw the first 40 so a broad search stays quick.
+      const shown = found.slice(0, 40);
       hits = '<div class="card"><div class="card-h"><h2>Search results</h2><span class="count">' +
         esc(found.length) + "</span></div><div class=\"card-b\">" +
-        (found.length ? found.map(function (s) { return snagRow(s, true); }).join("") :
+        (found.length > shown.length ? '<p class="muted" style="margin:0 0 8px">Showing the first ' + esc(shown.length) +
+          " of " + esc(found.length) + " — refine the search to narrow it down.</p>" : "") +
+        (found.length ? shown.map(function (s) { return snagRow(s, true); }).join("") :
           '<div class="empty">Nothing matches “' + esc(App.query) + "”.</div>") + "</div></div>";
     }
 
@@ -2984,7 +2997,7 @@ const UI = (function () {
       field("Inspection type", select("type", insp.type, INSPECTION_TYPES)) +
       field("Inspection date", dateField("inspection_date", insp.inspection_date)) +
       field("Next inspection", dateField("next_inspection_date", insp.next_inspection_date)) +
-      field("Inspector (" + st.settings.company_name + ")", input("inspector_name", insp.inspector_name)) +
+      field("Inspector" + (st.settings.company_name ? " (" + st.settings.company_name + ")" : ""), input("inspector_name", insp.inspector_name)) +
       field("Client / contractor QC", input("client_qc_name", insp.client_qc_name)) +
       "</div></div></div>" +
 
@@ -3855,7 +3868,8 @@ const UI = (function () {
       st.inspections.push(i);
       Store.save();
       App.route = "inspection"; App.inspId = i.id; App.tab = "info";
-      App.placing = false; App.pinFor = null;
+      // A fresh inspection must not hide its new snags behind the last filter.
+      App.filter = "all"; App.placing = false; App.pinFor = null;
       UI.render();
       UI.toast("Inspection " + i.number + " created");
     },
@@ -3947,22 +3961,30 @@ const UI = (function () {
         "Copy this snag to which tables?\n\nType numbers or ranges: 4-18, or 4,7,9\n" +
         'Each copy is named "' + prefix.trim() + ' <n>".', m ? m[2] : "");
       if (!answer) return;
-      const nums = [];
+      const nums = [], bad = [];
       answer.split(",").forEach(function (part) {
         part = part.trim();
+        if (!part) return;
         const range = part.match(/^(\d+)\s*[-–]\s*(\d+)$/);
         if (range) {
           const a = parseInt(range[1], 10), b = parseInt(range[2], 10);
           for (let n = Math.min(a, b); n <= Math.max(a, b); n++) nums.push(n);
         } else if (/^\d+$/.test(part)) nums.push(parseInt(part, 10));
+        else bad.push(part);
       });
+      // A mistyped entry ("x9", "4.5") would otherwise quietly leave that table
+      // without its snag, so copy nothing until every entry reads cleanly.
+      if (bad.length) return UI.toast("Could not read: " + bad.join(", ") + " — nothing copied", true);
       if (!nums.length) return UI.toast("Could not read those table numbers", true);
       if (nums.length > 200) return UI.toast("That is more than 200 copies — narrow the range", true);
       const st = Store.get(), i = insp();
+      // Keep the site's zero padding ("Table 07" → "Table 05"), and compare by
+      // number so "Table 07" never gets a copy of itself as "Table 7".
+      const width = m ? m[2].length : 0, own = m ? parseInt(m[2], 10) : null;
       let made = 0;
       nums.forEach(function (n) {
-        const name = (prefix + n).trim();
-        if (name === (s.block_table || "").trim()) return;   // don't duplicate onto itself
+        const name = (prefix + String(n).padStart(width, "0")).trim();
+        if (n === own || name === (s.block_table || "").trim()) return;   // don't duplicate onto itself
         st.snags.push(Model.snag(i, {
           risk: s.risk, category: s.category, description: s.description,
           required_action: s.required_action, block_table: name,
@@ -4353,6 +4375,8 @@ const UI = (function () {
   UI.setFieldFlush(flushPendingField);
   function flushPendingField() {
     clearTimeout(typeTimer);
+    // Typing still waiting on its pause goes to the sheet it was typed in.
+    if (pendingWrite) { const w = pendingWrite; pendingWrite = null; applyField(w.name, w.v, w.ctx); }
     const active = document.activeElement;
     const f = active && active.closest ? active.closest("[data-f]") : null;
     // Only real entry fields. A date button carries data-f too, but its
@@ -4360,20 +4384,25 @@ const UI = (function () {
     if (f && f.tagName !== "BUTTON") applyField(f.getAttribute("data-f"), f.value);
   }
 
-  function applyField(name, value) {
-    if ((name === "block_table" || name === "support_no" || name === "location_text" || name === "category" ||
-      name === "description" || name === "required_action" || name === "contractor_response" ||
-      name === "due_date" || name === "priority" || name === "risk") && !(App.modal && App.modal.type === "snag")) return;
+  // The only fields the form writes onto a snag or an inspection. Any other
+  // name (a stray "gps.lng" or "p.name") is dropped, never saved as junk.
+  const SNAG_FIELDS = ["block_table", "support_no", "location_text", "category", "description",
+    "required_action", "contractor_response", "due_date", "priority", "risk"];
+  const INSP_FIELDS = ["project_id", "area", "type", "inspection_date", "next_inspection_date",
+    "inspector_name", "client_qc_name", "general_remarks", "technical_notes"];
+
+  /** ctx is the sheet and inspection the value was typed in; a delayed write
+   *  passes the ones from its keystroke, so it cannot land on a newer sheet. */
+  function applyField(name, value, ctx) {
+    ctx = ctx || { modal: App.modal, inspId: App.route === "inspection" ? App.inspId : null };
+    const m = ctx.modal;
     const st = Store.get();
     if (name.indexOf("s.") === 0) {
       const key = name.slice(2);
       st.settings[key] = (key === "photo_max_edge" || key === "photo_quality") ? Number(value) : value;
-    } else if (name.indexOf("p.") === 0 && App.modal && App.modal.draft) {
-      App.modal.draft[name.slice(2)] = value;
-    } else if (name.indexOf("t.") === 0 && App.modal && App.modal.draft) {
-      App.modal.draft[name.slice(2)] = value;
-    } else if (name.indexOf("r.") === 0 && App.modal && App.modal.draft) {
-      App.modal.draft[name.slice(2)] = value;
+    } else if (name.indexOf("p.") === 0 || name.indexOf("t.") === 0 || name.indexOf("r.") === 0) {
+      if (!(m && m.draft)) return;
+      m.draft[name.slice(2)] = value;
     } else if (name.indexOf("ph.") === 0) {
       const pid = name.slice(3);
       Store.getPhoto(pid).then(function (p) {
@@ -4385,30 +4414,33 @@ const UI = (function () {
         Store.save();
       });
       return;
-    } else if (name.indexOf("gps.") === 0 && App.modal && App.modal.type === "gps") {
-      App.modal.draft = App.modal.draft || {};
+    } else if (name.indexOf("gps.") === 0) {
+      if (!(m && m.type === "gps")) return;
+      m.draft = m.draft || {};
       const key = name.slice(4);
-      if (App.modal.draft[key] === value) return;
-      App.modal.draft[key] = value;
+      if (m.draft[key] === value) return;
+      m.draft[key] = value;
       // Typed by hand, so a GPS fix still on its way must not overwrite it.
-      App.modal.draft.typed = true;
-      const box = function (k) { return document.querySelector('#modal [data-f="gps.' + k + '"]'); };
+      m.draft.typed = true;
+      // Only touch the boxes while this GPS sheet is still the one on screen.
+      const box = function (k) { return m === App.modal ? document.querySelector('#modal [data-f="gps.' + k + '"]') : null; };
       if (key === "pair") {
         const c = parseCoords(value);
         if (c) {
-          App.modal.draft.lat = String(c.lat); App.modal.draft.lng = String(c.lng);
+          m.draft.lat = String(c.lat); m.draft.lng = String(c.lng);
           // Show the pasted pair in the boxes, so what Save will use is on screen.
-          if (box("lat")) box("lat").value = App.modal.draft.lat;
-          if (box("lng")) box("lng").value = App.modal.draft.lng;
+          if (box("lat")) box("lat").value = m.draft.lat;
+          if (box("lng")) box("lng").value = m.draft.lng;
         }
       } else {
         // The boxes were edited after a paste, so they win over the pasted pair.
-        App.modal.draft.pair = "";
+        m.draft.pair = "";
         if (box("pair")) box("pair").value = "";
       }
       return;
-    } else if (App.modal && App.modal.type === "snag") {
-      const s = snagById(App.modal.id);
+    } else if (SNAG_FIELDS.indexOf(name) >= 0) {
+      if (!(m && m.type === "snag")) return;
+      const s = snagById(m.id);
       if (!s) return;
       s[name] = value;
       s.updated_at = new Date().toISOString();
@@ -4416,12 +4448,15 @@ const UI = (function () {
         const row = document.querySelector('[data-a="open-snag"][data-id="' + CSS.escape(s.id) + '"] .desc');
         if (row && name === "description") row.textContent = value || "(no description yet)";
       }
-    } else {
-      const i = insp();
+    } else if (INSP_FIELDS.indexOf(name) >= 0) {
+      const i = ctx.inspId ? st.inspections.find(function (x) { return x.id === ctx.inspId; }) : null;
       if (!i) return;
+      const changed = i[name] !== value;
       i[name] = value;
-      if (name === "project_id") UI.chrome();
-    }
+      // Redraw the whole view so the Project card and its Edit button follow the
+      // new project. Only on a real change: render() flushes the focused select.
+      if (name === "project_id" && changed) UI.render();
+    } else return;
     Store.save();
   }
 
@@ -4430,23 +4465,38 @@ const UI = (function () {
     if (!el) return;
     const a = el.getAttribute("data-a");
     if (actions[a]) {
-      ev.preventDefault();
+      // Save typing still waiting on its pause before Save, Close and the rest
+      // read the draft or swap the sheet.
+      if (pendingWrite) flushPendingField();
+      // The scrim wraps the whole sheet: cancelling every click inside it would
+      // stop a tap on a field's label from putting the cursor in that field.
+      if (a !== "scrim" || ev.target === el) ev.preventDefault();
       actions[a](el, ev);
     }
   });
 
   document.addEventListener("change", function (ev) {
     const f = ev.target.closest("[data-f]");
-    if (f) applyField(f.getAttribute("data-f"), f.value);
+    if (!f) return;
+    // The value is applied now, so the delayed write for this box is not needed.
+    if (pendingWrite && pendingWrite.el === f) { clearTimeout(typeTimer); pendingWrite = null; }
+    applyField(f.getAttribute("data-f"), f.value);
   });
 
   let typeTimer = null;
+  // The typed value waiting on the 320 ms pause, with the sheet and inspection
+  // it was typed in, so it lands there even if the sheet changes meanwhile.
+  let pendingWrite = null;
   document.addEventListener("input", function (ev) {
     const f = ev.target.closest("[data-f]");
     if (f && (f.tagName === "TEXTAREA" || f.type === "text")) {
       clearTimeout(typeTimer);
-      const name = f.getAttribute("data-f"), v = f.value;
-      typeTimer = setTimeout(function () { applyField(name, v); }, 320);
+      pendingWrite = { el: f, name: f.getAttribute("data-f"), v: f.value,
+        ctx: { modal: App.modal, inspId: App.route === "inspection" ? App.inspId : null } };
+      typeTimer = setTimeout(function () {
+        const w = pendingWrite; pendingWrite = null;
+        if (w) applyField(w.name, w.v, w.ctx);
+      }, 320);
     }
     if (ev.target.id === "q") {
       App.query = ev.target.value;
@@ -4468,7 +4518,11 @@ const UI = (function () {
     seg.querySelectorAll("button").forEach(function (x) { x.classList.remove("on"); });
     b.classList.add("on");
     applyField(seg.getAttribute("data-seg"), b.getAttribute("data-v"));
-    if (seg.getAttribute("data-seg") === "risk") UI.render();
+    if (seg.getAttribute("data-seg") === "risk") {
+      UI.render();
+      // Redraw the open sheet too, so its header risk tag matches the new Impact.
+      if (App.modal && App.modal.type === "snag") snagSheet(App.modal.id);
+    }
   });
 
   document.addEventListener("keydown", function (ev) {
