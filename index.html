@@ -1185,24 +1185,71 @@ const Store = (function () {
     return new Blob([JSON.stringify(payload)], { type: "application/json" });
   }
 
+  /** Each phone counts inspection numbers on its own, so a merge can bring
+   *  in a different inspection under a number already used here. Give the
+   *  backup's copy the next free number and re-code its snags. Inspections
+   *  already on this device never change: their numbers may be on issued
+   *  reports. Returns [{ from, to }]. */
+  function renumberClashes(incoming, counters) {
+    const localInsp = new Set(state.inspections.map(function (i) { return i.id; }));
+    const localSnag = new Set(state.snags.map(function (s) { return s.id; }));
+    const claimed = new Set(state.inspections.map(function (i) { return i.number; }));
+    // Every number in either copy, so a new number never lands on one the
+    // backup itself uses further down the list.
+    const taken = new Set(claimed);
+    incoming.inspections.forEach(function (i) { taken.add(i.number); });
+    const out = [];
+    incoming.inspections.forEach(function (insp) {
+      if (localInsp.has(insp.id) || !insp.number) return;
+      if (!claimed.has(insp.number)) { claimed.add(insp.number); return; }
+      // Keep the clashing number's own prefix and year when it has them.
+      const m = /^(.*)-(\d{4})-\d+$/.exec(insp.number);
+      const prefix = m ? m[1] : (state.settings.inspection_prefix || "LUX");
+      const year = m ? m[2] : String(new Date().getFullYear());
+      const head = prefix + "-" + year + "-";
+      let n = Number(counters[year]) || 0;
+      taken.forEach(function (x) {
+        if (typeof x === "string" && x.indexOf(head) === 0) n = Math.max(n, parseInt(x.slice(head.length), 10) || 0);
+      });
+      let to;
+      do { n++; to = head + String(n).padStart(6, "0"); } while (taken.has(to));
+      counters[year] = n;
+      taken.add(to); claimed.add(to);
+      const from = insp.number;
+      insp.number = to;
+      // Snag codes start with the inspection number. snag_number stays, so
+      // only the front of each code moves.
+      incoming.snags.forEach(function (sn) {
+        if (sn.inspection_id !== insp.id || localSnag.has(sn.id)) return;
+        if (sn.snag_number != null) sn.code = to + "-" + String(sn.snag_number).padStart(3, "0");
+        else if (sn.code && sn.code.indexOf(from + "-") === 0) sn.code = to + sn.code.slice(from.length);
+      });
+      out.push({ from: from, to: to });
+    });
+    return out;
+  }
+
   /** Swap in the restored state and save it. On failure the state in
-   *  memory is put back, so a later save cannot write a half restore. */
+   *  memory is put back, so a later save cannot write a half restore.
+   *  Returns the backup's inspections that a merge had to renumber. */
   async function commitRestore(incoming, mode) {
     let next;
+    let renumbered = [];
     if (mode === "replace") {
       next = incoming;
     } else {
       // Merge: keep everything already here, add what is missing by id.
       next = Object.assign({}, state);
-      ["projects", "inspections", "snags", "revisions", "templates", "remarks"].forEach(function (k) {
-        const have = new Set(state[k].map(function (x) { return x.id; }));
-        next[k] = state[k].concat(incoming[k].filter(function (x) { return !have.has(x.id); }));
-      });
       const localC = (state.counters && typeof state.counters === "object" && !Array.isArray(state.counters)) ? state.counters : {};
       const inC = (incoming.counters && typeof incoming.counters === "object" && !Array.isArray(incoming.counters)) ? incoming.counters : {};
       const merged = {};
       Object.keys(localC).concat(Object.keys(inC)).forEach(function (y) {
         merged[y] = Math.max(Number(localC[y]) || 0, Number(inC[y]) || 0);
+      });
+      renumbered = renumberClashes(incoming, merged);
+      ["projects", "inspections", "snags", "revisions", "templates", "remarks"].forEach(function (k) {
+        const have = new Set(state[k].map(function (x) { return x.id; }));
+        next[k] = state[k].concat(incoming[k].filter(function (x) { return !have.has(x.id); }));
       });
       next.counters = merged;
     }
@@ -1214,6 +1261,7 @@ const Store = (function () {
       state = prev;
       throw err;
     }
+    return renumbered;
   }
 
   async function restore(json, mode) {
@@ -1241,6 +1289,7 @@ const Store = (function () {
     // again, so the device is left exactly as it was.
     const added = [];
     const overwrite = [];   // replace: ids already here, updated only once committed
+    let renumbered;
     try {
       for (const p of photos) {
         if (await idbHas("photos", p.id)) {
@@ -1250,7 +1299,7 @@ const Store = (function () {
         await idbPut("photos", p);
         added.push(p.id);
       }
-      await commitRestore(incoming, mode);
+      renumbered = await commitRestore(incoming, mode);
     } catch (err) {
       for (const id of added) { try { await idbDel("photos", id); } catch (e) { } }
       throw err;
@@ -1273,7 +1322,7 @@ const Store = (function () {
     const have = new Set(present);
     let missing = 0;
     referenced(state).forEach(function (id) { if (!have.has(id)) missing++; });
-    return { missingPhotos: missing };
+    return { missingPhotos: missing, renumbered: renumbered };
   }
 
   async function usage() {
@@ -2319,6 +2368,7 @@ const UI = (function () {
       field("Report title", input("s.report_title", s.report_title)) +
       field("Default inspector name", input("s.inspector_name", s.inspector_name)) +
       field("Inspection number prefix", input("s.inspection_prefix", s.inspection_prefix)) +
+      '<p class="muted" style="margin:-4px 0 12px">Give each phone its own prefix (e.g. LUX-A, LUX-B) so two phones never issue the same inspection number.</p>' +
       field("Footer text", input("s.company_footer", s.company_footer)) +
       field("Risk legend", input("s.risk_legend", s.risk_legend)) +
       field("Abbreviation legend", textarea("s.legend", s.legend, "", 3)) +
@@ -3242,11 +3292,19 @@ const UI = (function () {
         UI.clearUsage();
         App.route = "home"; App.inspId = null;
         UI.render();
+        let msg = "Backup restored";
+        // Say which numbers changed, so a report already sent under the old
+        // number can still be matched up.
+        const rn = res.renumbered || [];
+        if (rn.length) {
+          msg += " · " + rn.length + " inspection" + (rn.length > 1 ? "s" : "") + " renumbered: " +
+            rn.map(function (r) { return r.from + " → " + r.to; }).join(", ");
+        }
         if (res.missingPhotos) {
-          UI.toast("Backup restored · " + res.missingPhotos + " photo" + (res.missingPhotos > 1 ? "s are" : " is") +
+          UI.toast(msg + " · " + res.missingPhotos + " photo" + (res.missingPhotos > 1 ? "s are" : " is") +
             " not on this device. Restore a full backup to bring them back.", true, 9000);
         } else {
-          UI.toast("Backup restored");
+          UI.toast(msg, false, rn.length ? 9000 : 2600);
         }
       } catch (err) {
         UI.toast("Restore failed: " + (err.message || err), true, 8000);
