@@ -39,6 +39,9 @@ body{
 }
 button,input,select,textarea{font:inherit;color:inherit}
 button{cursor:pointer}
+/* iOS Safari only sends taps on a span/div/img to the click handler when the
+   element has a pointer cursor, so give every data-a target one. */
+[data-a]{cursor:pointer}
 h1,h2,h3{margin:0;font-weight:700;letter-spacing:-.01em}
 a{color:var(--steel)}
 .hide{display:none !important}
@@ -203,7 +206,14 @@ textarea.inp{min-height:82px;resize:vertical;line-height:1.4}
 .photocell .k{
   position:absolute;left:4px;top:4px;font-size:9.5px;font-weight:800;letter-spacing:.08em;
   text-transform:uppercase;background:rgba(15,48,74,.86);color:#fff;padding:2px 5px;border-radius:4px;
+  border:0;margin:0;-webkit-appearance:none;appearance:none;
 }
+/* A plain button around a photo so it can be tapped and reached by keyboard
+   without changing how the photo looks. */
+.ph{display:block;width:100%;padding:0;margin:0;border:0;background:none;border-radius:9px;
+  -webkit-appearance:none;appearance:none;text-align:left}
+.ph:focus-visible{outline:3px solid #7FB3D0;outline-offset:-3px}
+.photocell .k:focus-visible{outline:3px solid #7FB3D0;outline-offset:1px}
 .photocell .x{
   position:absolute;right:3px;top:3px;width:34px;height:34px;border-radius:17px;border:0;
   background:rgba(180,35,24,.92);color:#fff;font-size:15px;line-height:1;font-weight:700;
@@ -218,6 +228,8 @@ textarea.inp{min-height:82px;resize:vertical;line-height:1.4}
   border-radius:var(--r);overflow:hidden;touch-action:manipulation}
 .planwrap img{width:100%;display:block}
 .planwrap.placing{outline:3px solid var(--steel);outline-offset:-3px;cursor:crosshair}
+/* Touch screens show no cursor, and iOS needs a pointer one to send the tap. */
+@media (hover:none){.planwrap.placing{cursor:pointer}}
 .pin{
   position:absolute;transform:translate(-50%,-50%);width:28px;height:28px;border-radius:14px;
   border:2.5px solid #fff;color:#fff;font-family:var(--mono);font-size:12px;font-weight:700;
@@ -269,6 +281,7 @@ textarea.inp{min-height:82px;resize:vertical;line-height:1.4}
 .check:last-child{border-bottom:0}
 .check .m{font-weight:800;font-family:var(--mono);flex:0 0 20px}
 .check.pass .m{color:var(--ok)} .check.fail .m{color:var(--hr)} .check.warn .m{color:var(--lr)}
+.check.wait .m{color:var(--ink-3)}
 
 /* ── progress ──────────────────────────────────────────────────────────── */
 .bar{height:8px;border-radius:4px;background:var(--band);overflow:hidden;display:flex}
@@ -793,6 +806,7 @@ const DocxKit = (function () {
   return {
     Doc: Doc, zip: zip, run: run, para: para, text: text, cell: cell, row: row,
     table: table, pageBreak: pageBreak, mmTwip: mmTwip, mmEmu: mmEmu, esc: esc,
+    crc32: crc32, dosTime: dosTime,   // the full backup .zip uses these too
   };
 })();
 
@@ -907,28 +921,89 @@ const Store = (function () {
     return state;
   }
 
+  /* A backup file can come from anywhere (WhatsApp, email), so migrate()
+     also forces every field back to the type the app itself writes. The
+     screens still escape everything; this keeps odd values from breaking
+     sorting, sums and class names. */
+  function isObj(x) { return x != null && typeof x === "object" && !Array.isArray(x); }
+  function asText(o, keys) {
+    keys.forEach(function (k) { if (o[k] != null && typeof o[k] !== "string") o[k] = String(o[k]); });
+  }
+  function asNum(v) {
+    if (v == null || v === "") return null;
+    const n = Number(v);
+    return isFinite(n) ? n : null;
+  }
+  function asIds(a) {
+    return Array.isArray(a) ? a.filter(function (x) { return x != null && x !== ""; }).map(String) : [];
+  }
+  function asRisk(r) { return r === "LR" ? "LR" : "HR"; }
+
   /** Forward-only migration. Old records must keep working. */
   function migrate(s) {
+    if (!isObj(s)) s = {};
     const base = blank();
-    const out = Object.assign(base, s);
-    out.settings = Object.assign({}, DEFAULT_SETTINGS, s.settings || {});
+    const out = Object.assign(blank(), s);
+    out.settings = Object.assign({}, DEFAULT_SETTINGS, isObj(s.settings) ? s.settings : {});
+    asText(out.settings, ["company_name", "report_title", "company_footer", "inspection_prefix",
+      "inspector_name", "risk_legend", "legend"]);
+    out.settings.photo_max_edge = asNum(out.settings.photo_max_edge) || DEFAULT_SETTINGS.photo_max_edge;
+    out.settings.photo_quality = asNum(out.settings.photo_quality) || DEFAULT_SETTINGS.photo_quality;
     ["projects", "inspections", "snags", "templates", "remarks", "revisions"].forEach(function (k) {
-      if (!Array.isArray(out[k])) out[k] = base[k];
+      out[k] = Array.isArray(out[k]) ? out[k].filter(isObj) : base[k];
     });
-    if (!Array.isArray(out.categories) || !out.categories.length) out.categories = CATEGORIES.slice();
+    out.categories = Array.isArray(out.categories)
+      ? out.categories.filter(function (c) { return c != null && c !== ""; }).map(String) : [];
+    if (!out.categories.length) out.categories = CATEGORIES.slice();
+    out.projects.forEach(function (p) {
+      asText(p, ["id", "code", "name", "client_name", "location", "status"]);
+    });
     out.snags.forEach(function (sn) {
-      if (!Array.isArray(sn.photos)) sn.photos = [];
-      if (!Array.isArray(sn.references)) sn.references = [];
-      if (!Array.isArray(sn.history)) sn.history = [];
-      if (!sn.status) sn.status = "open";
-      if (!sn.risk) sn.risk = "HR";
+      asText(sn, ["id", "inspection_id", "code", "block_table", "support_no", "location_text", "category",
+        "description", "required_action", "contractor_response", "due_date", "priority"]);
+      sn.photos = asIds(sn.photos);
+      sn.references = Array.isArray(sn.references) ? sn.references.filter(isObj) : [];
+      sn.references.forEach(function (r) { asText(r, ["ref_type", "document", "detail"]); });
+      sn.history = Array.isArray(sn.history) ? sn.history.filter(isObj) : [];
+      sn.history.forEach(function (h) { asText(h, ["from", "to", "at", "by", "comment"]); });
+      sn.status = STATUS_LABEL.hasOwnProperty(sn.status) ? sn.status : "open";
+      sn.risk = asRisk(sn.risk);
+      ["snag_number", "lat", "lng", "gps_accuracy", "pin_x", "pin_y"].forEach(function (k) {
+        sn[k] = asNum(sn[k]);
+      });
+      // A pin needs both coordinates, and a GPS fix needs both halves.
+      if (sn.pin_x == null || sn.pin_y == null) { sn.pin_x = null; sn.pin_y = null; }
+      if (sn.lat == null || sn.lng == null) { sn.lat = null; sn.lng = null; }
+      // Older builds saved a transient photo-kind list on each snag; it was never real data.
+      delete sn._kinds;
     });
     out.inspections.forEach(function (i) {
-      if (!Array.isArray(i.photos)) i.photos = [];
+      asText(i, ["id", "number", "project_id", "area", "type", "inspection_date", "next_inspection_date",
+        "inspector_name", "client_qc_name", "status", "general_remarks", "technical_notes",
+        "site_photo_id", "site_plan_id"]);
+      i.photos = asIds(i.photos);
       if (i.general_remarks == null) i.general_remarks = "";
       if (i.technical_notes == null) i.technical_notes = "";
+      i.rev = asNum(i.rev) || 0;
+      if (i.last_snag_number != null) i.last_snag_number = asNum(i.last_snag_number);
     });
-    if (!out.counters || typeof out.counters !== "object" || Array.isArray(out.counters)) out.counters = {};
+    out.revisions.forEach(function (r) {
+      asText(r, ["id", "inspection_id", "reason", "by", "created_at"]);
+      r.rev = asNum(r.rev) || 0;
+      r.snag_count = asNum(r.snag_count) || 0;
+    });
+    out.templates.forEach(function (t) {
+      asText(t, ["id", "label", "category", "description", "required_action", "ref_type", "ref_document", "ref_detail"]);
+      t.risk = asRisk(t.risk);
+    });
+    out.remarks.forEach(function (r) {
+      asText(r, ["id", "title", "kind", "body", "source"]);
+    });
+    if (!isObj(out.counters)) out.counters = {};
+    Object.keys(out.counters).forEach(function (y) {
+      const n = asNum(out.counters[y]);
+      if (n == null) delete out.counters[y]; else out.counters[y] = n;
+    });
     return out;
   }
 
@@ -1112,38 +1187,242 @@ const Store = (function () {
   }
 
   /* ------------------------------------------------------- backup/restore -- */
+  /* A full backup is a store-only .zip: backup.json (the data, with photo
+     details but no photo bytes) plus one photos/<id>.jpg per photo. The old
+     full backup put every photo in one JSON string as base64, which ran
+     phones out of memory on big sites. Here the zip is a Blob built from
+     parts, so the photo bytes are never copied into one big buffer. */
+  const ZIP_DAMAGED = "This backup .zip is damaged or incomplete.";
+
+  /** CRC and length of one entry. The bytes are dropped on return, so only
+   *  one photo is ever read into memory at a time. */
+  async function crcOf(data) {
+    const bytes = await toBytes(data);
+    return bytes ? { crc: DocxKit.crc32(bytes), size: bytes.length } : { crc: 0, size: 0 };
+  }
+
+  /** [{ name, data: Blob | bytes }] → a store-only zip Blob. */
+  async function zipBlob(entries) {
+    if (entries.length > 0xffff) throw new Error("Too many photos for one backup file.");
+    const now = DocxKit.dosTime(new Date());
+    const enc = new TextEncoder();
+    const parts = [];
+    const central = [];
+    let offset = 0;
+    for (const e of entries) {
+      const name = enc.encode(e.name);
+      const sum = await crcOf(e.data);
+      // Plain zip offsets stop at 4 GB; fail clearly rather than write a
+      // file nothing can open.
+      if (offset + 30 + name.length + sum.size > 0xffffffff) {
+        throw new Error("This backup would be over 4 GB. Remove unused photos, or back up data only.");
+      }
+      const local = new DataView(new ArrayBuffer(30));
+      local.setUint32(0, 0x04034b50, true);
+      local.setUint16(4, 20, true);          // version needed
+      local.setUint16(6, 0x0800, true);      // flags: names are UTF-8
+      local.setUint16(8, 0, true);           // method: store
+      local.setUint16(10, now.time, true);
+      local.setUint16(12, now.date, true);
+      local.setUint32(14, sum.crc, true);
+      local.setUint32(18, sum.size, true);
+      local.setUint32(22, sum.size, true);
+      local.setUint16(26, name.length, true);
+      // The photo Blob itself goes in as a part: the browser points at it
+      // instead of copying it into memory.
+      parts.push(local.buffer, name, e.data);
+
+      const cd = new DataView(new ArrayBuffer(46));
+      cd.setUint32(0, 0x02014b50, true);
+      cd.setUint16(4, 20, true);
+      cd.setUint16(6, 20, true);
+      cd.setUint16(8, 0x0800, true);
+      cd.setUint16(12, now.time, true);
+      cd.setUint16(14, now.date, true);
+      cd.setUint32(16, sum.crc, true);
+      cd.setUint32(20, sum.size, true);
+      cd.setUint32(24, sum.size, true);
+      cd.setUint16(28, name.length, true);
+      cd.setUint32(42, offset, true);
+      central.push(cd.buffer, name);
+
+      offset += 30 + name.length + sum.size;
+    }
+    let centralSize = 0;
+    central.forEach(function (c) { centralSize += c.byteLength; });
+    if (offset + centralSize > 0xffffffff) {
+      throw new Error("This backup would be over 4 GB. Remove unused photos, or back up data only.");
+    }
+    const end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054b50, true);
+    end.setUint16(8, entries.length, true);
+    end.setUint16(10, entries.length, true);
+    end.setUint32(12, centralSize, true);
+    end.setUint32(16, offset, true);
+    return new Blob(parts.concat(central, [end.buffer]), { type: "application/zip" });
+  }
+
+  /** Bytes [a, b) of a file as a DataView. */
+  async function readRange(file, a, b) {
+    const u = await toBytes(file.slice(a, b));
+    return new DataView(u.buffer, u.byteOffset, u.byteLength);
+  }
+
+  /** The entries of a store-only zip, found through the central directory
+   *  at the end of the file. Only the directory is read; each entry comes
+   *  back as a slice of the file, so no photo is read or decoded here.
+   *  Returns Map name → { blob, crc }. */
+  async function unzipBlob(file) {
+    // The end record is 22 bytes plus a comment of up to 64 KB.
+    const tailStart = Math.max(0, file.size - (22 + 0xffff));
+    const tail = await readRange(file, tailStart, file.size);
+    let end = -1;
+    for (let i = tail.byteLength - 22; i >= 0; i--) {
+      if (tail.getUint32(i, true) === 0x06054b50) { end = i; break; }
+    }
+    if (end < 0) throw new Error(ZIP_DAMAGED);
+    const count = tail.getUint16(end + 10, true);
+    const cdSize = tail.getUint32(end + 12, true);
+    const cdStart = tail.getUint32(end + 16, true);
+    if (cdStart + cdSize > tailStart + end) throw new Error(ZIP_DAMAGED);
+    const cd = await readRange(file, cdStart, cdStart + cdSize);
+    const dec = new TextDecoder();
+    const out = new Map();
+    let pos = 0;
+    for (let n = 0; n < count; n++) {
+      if (pos + 46 > cd.byteLength || cd.getUint32(pos, true) !== 0x02014b50) throw new Error(ZIP_DAMAGED);
+      const method = cd.getUint16(pos + 10, true);
+      const crc = cd.getUint32(pos + 16, true);
+      const size = cd.getUint32(pos + 20, true);
+      const nameLen = cd.getUint16(pos + 28, true);
+      const skip = nameLen + cd.getUint16(pos + 30, true) + cd.getUint16(pos + 32, true);
+      const at = cd.getUint32(pos + 42, true);
+      if (pos + 46 + skip > cd.byteLength) throw new Error(ZIP_DAMAGED);
+      const name = dec.decode(new Uint8Array(cd.buffer, cd.byteOffset + pos + 46, nameLen));
+      pos += 46 + skip;
+      if (method !== 0) {
+        throw new Error("This backup .zip was re-compressed by another app. Restore the file the app saved.");
+      }
+      // The local header can carry its own extra field, so the data starts
+      // where that header says, not where the central copy implies.
+      const local = await readRange(file, at, at + 30);
+      if (local.byteLength < 30 || local.getUint32(0, true) !== 0x04034b50) throw new Error(ZIP_DAMAGED);
+      const start = at + 30 + local.getUint16(26, true) + local.getUint16(28, true);
+      if (start + size > cdStart) throw new Error(ZIP_DAMAGED);
+      out.set(name, { blob: file.slice(start, start + size), crc: crc });
+    }
+    return out;
+  }
+
   async function backup(withPhotos) {
     const payload = { format: "lumax-punchlist-backup", version: 1, exported_at: new Date().toISOString(), state: state, photos: [] };
-    if (withPhotos) {
-      const all = await idbAll("photos");
-      for (const p of all) {
-        payload.photos.push({
-          id: p.id, w: p.w, h: p.h, kind: p.kind, caption: p.caption, thumb: p.thumb,
-          created_at: p.created_at, data: await blobToB64(p.blob),
-        });
+    if (!withPhotos) return new Blob([JSON.stringify(payload)], { type: "application/json" });
+    const files = [];
+    const names = new Set();
+    const all = await idbAll("photos");
+    for (const p of all) {
+      const meta = {
+        id: p.id, w: p.w, h: p.h, kind: p.kind, caption: p.caption, thumb: p.thumb,
+        created_at: p.created_at, file: null,
+      };
+      if (p.blob) {
+        // Ids are UUIDs, but one restored from an old file could hold
+        // anything, so keep the path to safe characters and unique.
+        const base = "photos/" + String(p.id).replace(/[^A-Za-z0-9_-]/g, "_");
+        let name = base + ".jpg";
+        for (let n = 2; names.has(name); n++) name = base + "-" + n + ".jpg";
+        names.add(name);
+        meta.file = name;
+        files.push({ name: name, data: p.blob });
       }
+      payload.photos.push(meta);
     }
-    return new Blob([JSON.stringify(payload)], { type: "application/json" });
+    files.unshift({ name: "backup.json", data: new TextEncoder().encode(JSON.stringify(payload)) });
+    return zipBlob(files);
+  }
+
+  /** Read a backup file: a full backup .zip, or a .json (a data-only
+   *  backup, or a full backup from before photos moved into a zip).
+   *  Returns { json, files } where files maps zip paths to Blobs. */
+  async function openBackup(file) {
+    const head = await toBytes(file.slice(0, 4));
+    const isZip = head && head.length === 4 && head[0] === 0x50 && head[1] === 0x4b && head[2] === 3 && head[3] === 4;
+    if (!isZip) return { json: JSON.parse(await file.text()), files: null };
+    const entries = await unzipBlob(file);
+    const main = entries.get("backup.json");
+    if (!main) throw new Error("That .zip is not a Lumax Punch List backup.");
+    const bytes = await toBytes(main.blob);
+    if (DocxKit.crc32(bytes) !== main.crc) throw new Error(ZIP_DAMAGED);
+    const files = new Map();
+    entries.forEach(function (e, name) { files.set(name, e.blob); });
+    return { json: JSON.parse(new TextDecoder().decode(bytes)), files: files };
+  }
+
+  /** Each phone counts inspection numbers on its own, so a merge can bring
+   *  in a different inspection under a number already used here. Give the
+   *  backup's copy the next free number and re-code its snags. Inspections
+   *  already on this device never change: their numbers may be on issued
+   *  reports. Returns [{ from, to }]. */
+  function renumberClashes(incoming, counters) {
+    const localInsp = new Set(state.inspections.map(function (i) { return i.id; }));
+    const localSnag = new Set(state.snags.map(function (s) { return s.id; }));
+    const claimed = new Set(state.inspections.map(function (i) { return i.number; }));
+    // Every number in either copy, so a new number never lands on one the
+    // backup itself uses further down the list.
+    const taken = new Set(claimed);
+    incoming.inspections.forEach(function (i) { taken.add(i.number); });
+    const out = [];
+    incoming.inspections.forEach(function (insp) {
+      if (localInsp.has(insp.id) || !insp.number) return;
+      if (!claimed.has(insp.number)) { claimed.add(insp.number); return; }
+      // Keep the clashing number's own prefix and year when it has them.
+      const m = /^(.*)-(\d{4})-\d+$/.exec(insp.number);
+      const prefix = m ? m[1] : (state.settings.inspection_prefix || "LUX");
+      const year = m ? m[2] : String(new Date().getFullYear());
+      const head = prefix + "-" + year + "-";
+      let n = Number(counters[year]) || 0;
+      taken.forEach(function (x) {
+        if (typeof x === "string" && x.indexOf(head) === 0) n = Math.max(n, parseInt(x.slice(head.length), 10) || 0);
+      });
+      let to;
+      do { n++; to = head + String(n).padStart(6, "0"); } while (taken.has(to));
+      counters[year] = n;
+      taken.add(to); claimed.add(to);
+      const from = insp.number;
+      insp.number = to;
+      // Snag codes start with the inspection number. snag_number stays, so
+      // only the front of each code moves.
+      incoming.snags.forEach(function (sn) {
+        if (sn.inspection_id !== insp.id || localSnag.has(sn.id)) return;
+        if (sn.snag_number != null) sn.code = to + "-" + String(sn.snag_number).padStart(3, "0");
+        else if (sn.code && sn.code.indexOf(from + "-") === 0) sn.code = to + sn.code.slice(from.length);
+      });
+      out.push({ from: from, to: to });
+    });
+    return out;
   }
 
   /** Swap in the restored state and save it. On failure the state in
-   *  memory is put back, so a later save cannot write a half restore. */
+   *  memory is put back, so a later save cannot write a half restore.
+   *  Returns the backup's inspections that a merge had to renumber. */
   async function commitRestore(incoming, mode) {
     let next;
+    let renumbered = [];
     if (mode === "replace") {
       next = incoming;
     } else {
       // Merge: keep everything already here, add what is missing by id.
       next = Object.assign({}, state);
-      ["projects", "inspections", "snags", "revisions", "templates", "remarks"].forEach(function (k) {
-        const have = new Set(state[k].map(function (x) { return x.id; }));
-        next[k] = state[k].concat(incoming[k].filter(function (x) { return !have.has(x.id); }));
-      });
       const localC = (state.counters && typeof state.counters === "object" && !Array.isArray(state.counters)) ? state.counters : {};
       const inC = (incoming.counters && typeof incoming.counters === "object" && !Array.isArray(incoming.counters)) ? incoming.counters : {};
       const merged = {};
       Object.keys(localC).concat(Object.keys(inC)).forEach(function (y) {
         merged[y] = Math.max(Number(localC[y]) || 0, Number(inC[y]) || 0);
+      });
+      renumbered = renumberClashes(incoming, merged);
+      ["projects", "inspections", "snags", "revisions", "templates", "remarks"].forEach(function (k) {
+        const have = new Set(state[k].map(function (x) { return x.id; }));
+        next[k] = state[k].concat(incoming[k].filter(function (x) { return !have.has(x.id); }));
       });
       next.counters = merged;
     }
@@ -1155,19 +1434,38 @@ const Store = (function () {
       state = prev;
       throw err;
     }
+    return renumbered;
   }
 
-  async function restore(json, mode) {
+  /** `files` is the zip's path → Blob map from openBackup(); null for a
+   *  .json backup, whose photos (if any) are base64 inside it. */
+  async function restore(json, mode, files) {
     if (!json || json.format !== "lumax-punchlist-backup") {
       throw new Error("That file is not a Lumax Punch List backup.");
     }
     const incoming = migrate(json.state || {});
     // Decode every photo before anything here changes, so a damaged file
     // fails cleanly instead of half way through.
-    const photos = (json.photos || []).filter(function (p) { return p && p.id; }).map(function (p) {
+    // Photo ids end up in attributes and the thumb in an img src, so they
+    // get the same type checks as the state.
+    const photos = (Array.isArray(json.photos) ? json.photos : []).filter(function (p) {
+      return isObj(p) && p.id != null && p.id !== "";
+    }).map(function (p) {
+      let blob;
+      if (p.file != null && p.file !== "") {
+        // Zip backup: the photo is a slice of the file, stored as it is.
+        const part = files && files.get(String(p.file));
+        if (!part) throw new Error("The backup is missing the photo file " + p.file + ".");
+        blob = part.slice(0, part.size, "image/jpeg");
+      } else {
+        blob = b64ToBlob(p.data, "image/jpeg");
+      }
       return {
-        id: p.id, blob: b64ToBlob(p.data, "image/jpeg"), thumb: p.thumb, w: p.w, h: p.h,
-        kind: p.kind, caption: p.caption, created_at: p.created_at,
+        id: String(p.id), blob: blob,
+        thumb: typeof p.thumb === "string" && p.thumb.indexOf("data:image/") === 0 ? p.thumb : null,
+        w: asNum(p.w), h: asNum(p.h),
+        kind: p.kind === "after" || p.kind === "closeout" ? p.kind : "before",
+        caption: p.caption == null ? "" : String(p.caption), created_at: p.created_at == null ? "" : String(p.created_at),
       };
     });
     // Add the backup's new photos before deleting or changing any. If anything
@@ -1175,6 +1473,7 @@ const Store = (function () {
     // again, so the device is left exactly as it was.
     const added = [];
     const overwrite = [];   // replace: ids already here, updated only once committed
+    let renumbered;
     try {
       for (const p of photos) {
         if (await idbHas("photos", p.id)) {
@@ -1184,7 +1483,7 @@ const Store = (function () {
         await idbPut("photos", p);
         added.push(p.id);
       }
-      await commitRestore(incoming, mode);
+      renumbered = await commitRestore(incoming, mode);
     } catch (err) {
       for (const id of added) { try { await idbDel("photos", id); } catch (e) { } }
       throw err;
@@ -1207,7 +1506,7 @@ const Store = (function () {
     const have = new Set(present);
     let missing = 0;
     referenced(state).forEach(function (id) { if (!have.has(id)) missing++; });
-    return { missingPhotos: missing };
+    return { missingPhotos: missing, renumbered: renumbered };
   }
 
   async function usage() {
@@ -1245,7 +1544,7 @@ const Store = (function () {
     release: release, onStale: onStale,
     addPhoto: addPhoto, getPhoto: getPhoto, delPhoto: delPhoto,
     photoUrl: photoUrl, photoThumb: photoThumb, photoBytes: photoBytes,
-    backup: backup, restore: restore, usage: usage, orphans: orphans,
+    backup: backup, openBackup: openBackup, restore: restore, usage: usage, orphans: orphans,
     idbAll: idbAll, idbPut: idbPut,
   };
 })();
@@ -1775,15 +2074,20 @@ const Report = (function () {
     add(noAction.length ? "warn" : "pass",
       noAction.length ? noAction.length + " snags have no required action" : "Every snag has a required action", "");
 
+    // Photo kinds live in the photos store, so this reads the cache refreshEvidence() fills.
+    const verified = snags.filter(function (s) { return DONE.indexOf(s.status) >= 0; });
     const verifiedNoEvidence = [];
-    snags.filter(function (s) { return DONE.indexOf(s.status) >= 0; }).forEach(function (s) {
-      const kinds = (s._kinds || []);
-      if (!kinds.length) verifiedNoEvidence.push(s.snag_number);
+    let unchecked = false;
+    verified.forEach(function (s) {
+      if (!evidence.has(s.id)) unchecked = true;
+      else if (!evidence.get(s.id)) verifiedNoEvidence.push(s.snag_number);
     });
-    if (verifiedNoEvidence.length) {
+    if (unchecked) {
+      add("wait", "Checking close-out photos…", "");
+    } else if (verifiedNoEvidence.length) {
       add("warn", verifiedNoEvidence.length + " verified snags have no close-out photo",
         "Snags " + verifiedNoEvidence.join(", ") + " — the close-out pack will show text only.");
-    } else if (snags.some(function (s) { return DONE.indexOf(s.status) >= 0; })) {
+    } else if (verified.length) {
       add("pass", "Verified snags carry close-out evidence", "");
     }
 
@@ -1803,17 +2107,24 @@ const Report = (function () {
     return { checks: out, ready: ready };
   }
 
-  /** Attach photo kinds so pre-flight can see close-out evidence. */
-  async function annotate(insp) {
-    const snags = snagsOf(insp.id);
-    for (const s of snags) {
-      const kinds = [];
+  /* Snag id -> has an After/Close-out photo. Kept out of state on purpose:
+   * it is derived from the photo records and must never be saved. */
+  const evidence = new Map();
+
+  /** Re-read photo kinds for the verified snags. Resolves true only when an
+   *  answer changed, so the caller re-renders once and then stops. */
+  async function refreshEvidence(insp) {
+    let changed = false;
+    for (const s of snagsOf(insp.id)) {
+      if (DONE.indexOf(s.status) < 0) continue;
+      let has = false;
       for (const id of (s.photos || [])) {
         const p = await Store.getPhoto(id);
-        if (p && (p.kind === "closeout" || p.kind === "after")) kinds.push(p.kind);
+        if (p && (p.kind === "closeout" || p.kind === "after")) { has = true; break; }
       }
-      s._kinds = kinds;
+      if (evidence.get(s.id) !== has) { evidence.set(s.id, has); changed = true; }
     }
+    return changed;
   }
 
   function fileBase(insp, mode, rev) {
@@ -1827,7 +2138,7 @@ const Report = (function () {
   }
 
   return {
-    buildDocx: buildDocx, buildCsv: buildCsv, preflight: preflight, annotate: annotate,
+    buildDocx: buildDocx, buildCsv: buildCsv, preflight: preflight, refreshEvidence: refreshEvidence,
     renderMap: renderMap, fileBase: fileBase, filterSnags: filterSnags,
   };
 })();
@@ -1861,14 +2172,21 @@ const UI = (function () {
     toastTimer = setTimeout(function () { el.className = "toast" + (bad ? " bad" : ""); }, ms || 2600);
   }
 
-  const tag = function (cls, txt) { return '<span class="tag ' + cls + '">' + esc(txt) + "</span>"; };
+  const tag = function (cls, txt) { return '<span class="tag ' + esc(cls) + '">' + esc(txt) + "</span>"; };
   const riskTag = function (r) { return tag("t-" + r, r); };
   const statusTag = function (s) { return tag("t-" + s, STATUS_LABEL[s] || s); };
 
+  /** A 0–1 fraction as a CSS percentage. A restored file can hold anything,
+   *  so only a finite number ever reaches a style attribute. */
+  function pct(f) {
+    const n = Number(f);
+    return isFinite(n) ? (Math.min(1, Math.max(0, n)) * 100).toFixed(2) : "0";
+  }
+
   function bar(t) {
     if (!t.total) return "";
-    const pc = function (n) { return (n / t.total * 100).toFixed(2) + "%"; };
-    return '<div class="bar" title="' + t.open + " open, " + t.prog + " in progress, " + t.done + ' done">' +
+    const pc = function (n) { return pct(n / t.total) + "%"; };
+    return '<div class="bar" title="' + esc(t.open + " open, " + t.prog + " in progress, " + t.done + " done") + '">' +
       '<i class="open" style="width:' + pc(t.open) + '"></i>' +
       '<i class="prog" style="width:' + pc(t.prog) + '"></i>' +
       '<i class="done" style="width:' + pc(t.done) + '"></i></div>';
@@ -1879,27 +2197,27 @@ const UI = (function () {
   }
   function input(name, value, opts) {
     opts = opts || {};
-    return '<input class="inp" data-f="' + name + '" type="' + (opts.type || "text") + '" value="' +
+    return '<input class="inp" data-f="' + esc(name) + '" type="' + esc(opts.type || "text") + '" value="' +
       esc(value == null ? "" : value) + '"' + (opts.placeholder ? ' placeholder="' + esc(opts.placeholder) + '"' : "") +
-      (opts.inputmode ? ' inputmode="' + opts.inputmode + '"' : "") + " />";
+      (opts.inputmode ? ' inputmode="' + esc(opts.inputmode) + '"' : "") + " />";
   }
   function dateField(name, value) {
     const shown = value ? value : "Pick a date";
-    return '<button type="button" class="datebtn" data-a="open-date" data-f="' + name + '" data-v="' +
+    return '<button type="button" class="datebtn" data-a="open-date" data-f="' + esc(name) + '" data-v="' +
       esc(value || "") + '">' + esc(shown) + "</button>";
   }
   function textarea(name, value, ph, rows) {
-    return '<textarea class="inp" data-f="' + name + '"' + (rows ? ' style="min-height:' + rows * 22 + 'px"' : "") +
+    return '<textarea class="inp" data-f="' + esc(name) + '"' + (rows ? ' style="min-height:' + (Number(rows) || 0) * 22 + 'px"' : "") +
       (ph ? ' placeholder="' + esc(ph) + '"' : "") + ">" + esc(value || "") + "</textarea>";
   }
   function select(name, value, options) {
-    return '<select class="inp" data-f="' + name + '">' + options.map(function (o) {
+    return '<select class="inp" data-f="' + esc(name) + '">' + options.map(function (o) {
       const v = Array.isArray(o) ? o[0] : o, l = Array.isArray(o) ? o[1] : o;
       return '<option value="' + esc(v) + '"' + (String(value) === String(v) ? " selected" : "") + ">" + esc(l) + "</option>";
     }).join("") + "</select>";
   }
   function seg(name, value, options, cls) {
-    return '<div class="seg ' + (cls || "") + '" data-seg="' + name + '">' + options.map(function (o) {
+    return '<div class="seg ' + esc(cls || "") + '" data-seg="' + esc(name) + '">' + options.map(function (o) {
       const v = Array.isArray(o) ? o[0] : o, l = Array.isArray(o) ? o[1] : o;
       return '<button type="button" data-v="' + esc(v) + '" class="' + (String(value) === String(v) ? "on" : "") + '">' + esc(l) + "</button>";
     }).join("") + "</div>";
@@ -1930,8 +2248,8 @@ const UI = (function () {
       const items = [["snags", "Snags", t.total], ["plan", "Plan", ""], ["info", "Info", ""], ["report", "Report", ""]];
       tabs.className = "tabs";
       tabs.innerHTML = items.map(function (i) {
-        return '<button data-a="tab" data-v="' + i[0] + '" class="' + (App.tab === i[0] ? "on" : "") + '">' +
-          (i[2] !== "" ? '<span class="n">' + i[2] + "</span>" : "") + i[1] + "</button>";
+        return '<button data-a="tab" data-v="' + esc(i[0]) + '" class="' + (App.tab === i[0] ? "on" : "") + '">' +
+          (i[2] !== "" ? '<span class="n">' + esc(i[2]) + "</span>" : "") + esc(i[1]) + "</button>";
       }).join("");
       fab.innerHTML = App.tab === "snags"
         ? '<button class="fab" data-a="new-snag">＋ Add snag</button>' : "";
@@ -1956,7 +2274,7 @@ const UI = (function () {
           " " + s.required_action).toLowerCase().indexOf(q) >= 0;
       }).slice(0, 40);
       hits = '<div class="card"><div class="card-h"><h2>Search results</h2><span class="count">' +
-        found.length + "</span></div><div class=\"card-b\">" +
+        esc(found.length) + "</span></div><div class=\"card-b\">" +
         (found.length ? found.map(function (s) { return snagRow(s, true); }).join("") :
           '<div class="empty">Nothing matches “' + esc(App.query) + "”.</div>") + "</div></div>";
     }
@@ -1972,16 +2290,16 @@ const UI = (function () {
         '<div class="card-h"><div style="min-width:0"><h2 style="text-transform:none;font-size:15px;letter-spacing:0">' +
         esc(p.name || "Untitled project") + "</h2>" +
         '<div class="muted mono">' + esc(p.code || "no code") + (p.client_name ? " · " + esc(p.client_name) : "") + "</div></div>" +
-        '<button class="btn btn-xs" data-a="edit-project" data-id="' + p.id + '">Edit</button></div>' +
+        '<button class="btn btn-xs" data-a="edit-project" data-id="' + esc(p.id) + '">Edit</button></div>' +
         '<div class="card-b">' + bar(t) +
         '<div class="chiprow" style="margin:9px 0 11px">' +
-        '<span class="count hr">' + t.outstanding + " open</span>" +
-        '<span class="count">' + t.hrOpen + " HR open</span>" +
-        '<span class="count ok">' + t.done + " done</span></div>" +
+        '<span class="count hr">' + esc(t.outstanding) + " open</span>" +
+        '<span class="count">' + esc(t.hrOpen) + " HR open</span>" +
+        '<span class="count ok">' + esc(t.done) + " done</span></div>" +
         (insps.length ? insps.map(inspectionRow).join("") :
           '<div class="muted" style="padding:6px 0 10px">No inspections yet.</div>') +
         '<div class="btn-row" style="margin-top:10px">' +
-        '<button class="btn btn-p btn-sm" data-a="new-inspection" data-id="' + p.id + '">＋ New inspection</button>' +
+        '<button class="btn btn-p btn-sm" data-a="new-inspection" data-id="' + esc(p.id) + '">＋ New inspection</button>' +
         "</div></div></div>";
     }).join("");
 
@@ -2003,12 +2321,12 @@ const UI = (function () {
 
   function inspectionRow(i) {
     const t = tally(snagsOf(i.id));
-    return '<button class="row" data-a="open-inspection" data-id="' + i.id + '">' +
+    return '<button class="row" data-a="open-inspection" data-id="' + esc(i.id) + '">' +
       '<div class="grow"><b>' + esc(i.type) + " · " + esc(i.inspection_date) + "</b>" +
       '<span class="sub">' + esc(i.number) + (i.area ? " · " + esc(i.area) : "") +
-      (i.rev ? " · Rev " + i.rev : "") + "</span></div>" +
+      (i.rev ? " · Rev " + esc(i.rev) : "") + "</span></div>" +
       '<span class="count' + (t.outstanding ? " hr" : " ok") + '">' +
-      (t.outstanding ? t.outstanding + " open" : t.total ? "done" : "empty") + "</span></button>";
+      (t.outstanding ? esc(t.outstanding) + " open" : t.total ? "done" : "empty") + "</span></button>";
   }
 
   /* -------------------------------------------------------------- snags --- */
@@ -2017,15 +2335,15 @@ const UI = (function () {
     const loc = [s.block_table, s.support_no ? "Supp " + s.support_no : "", s.location_text]
       .filter(Boolean).join(" · ");
     const thumb = (s.photos || []).length
-      ? '<img class="thumb" data-pid="' + s.photos[0] + '" alt="" />' : "";
-    return '<button class="rail r-' + s.risk + (done ? " done" : "") + '" data-a="open-snag" data-id="' + s.id + '">' +
+      ? '<img class="thumb" data-pid="' + esc(s.photos[0]) + '" alt="" />' : "";
+    return '<button class="rail r-' + esc(s.risk) + (done ? " done" : "") + '" data-a="open-snag" data-id="' + esc(s.id) + '">' +
       thumb +
-      '<span class="rh"><span class="num">' + s.snag_number + "</span>" +
+      '<span class="rh"><span class="num">' + esc(s.snag_number) + "</span>" +
       riskTag(s.risk) + statusTag(s.status) +
       (s.pin_x != null ? '<span class="tag" style="color:var(--ink-3)">pin</span>' : "") + "</span>" +
       '<span class="desc">' + esc(s.description || "(no description yet)") + "</span>" +
       '<span class="meta">' + esc(showCode ? s.code : loc || s.code) +
-      ((s.photos || []).length ? " · " + s.photos.length + "📷" : "") + "</span></button>";
+      ((s.photos || []).length ? " · " + esc(s.photos.length) + "📷" : "") + "</span></button>";
   }
 
   function viewSnags(insp) {
@@ -2049,12 +2367,12 @@ const UI = (function () {
     const last = all[all.length - 1];
     return '<div class="stack">' +
       '<div class="scroller">' + chips.map(function (c) {
-        return '<button class="chip' + (f === c[0] ? " on" : "") + '" data-a="filter" data-v="' + c[0] + '">' + esc(c[1]) + "</button>";
+        return '<button class="chip' + (f === c[0] ? " on" : "") + '" data-a="filter" data-v="' + esc(c[0]) + '">' + esc(c[1]) + "</button>";
       }).join("") + "</div>" +
       (all.length ? '<div class="card"><div class="card-b" style="padding:10px">' + bar(t) + "</div></div>" : "") +
       '<div class="btn-row">' +
       '<button class="btn btn-p" data-a="new-snag">＋ Add snag</button>' +
-      (last ? '<button class="btn" data-a="repeat-last">Repeat snag ' + last.snag_number + "</button>" : "") +
+      (last ? '<button class="btn" data-a="repeat-last">Repeat snag ' + esc(last.snag_number) + "</button>" : "") +
       "</div>" +
       "<div>" + list + "</div></div>";
   }
@@ -2064,7 +2382,8 @@ const UI = (function () {
     const st = Store.get();
     const p = projectOf(insp);
     const cover = insp.site_photo_id
-      ? '<img data-pid="' + insp.site_photo_id + '" data-a="view-photo" data-id="' + insp.site_photo_id + '" style="width:100%;border-radius:9px;border:1px solid var(--line)" alt="Site cover photo — tap to add a caption" />' +
+      ? '<button type="button" class="ph" data-a="view-photo" data-id="' + esc(insp.site_photo_id) + '">' +
+      '<img data-pid="' + esc(insp.site_photo_id) + '" style="width:100%;border-radius:9px;border:1px solid var(--line)" alt="Site cover photo — tap to add a caption" /></button>' +
       '<div class="btn-row" style="margin-top:8px"><button class="btn btn-sm" data-a="pick-photo" data-v="site">Library</button>' +
       '<button class="btn btn-sm" data-a="take-photo" data-v="site">Camera</button>' +
       '<button class="btn btn-sm btn-d" data-a="clear-photo" data-v="site">Remove</button></div>'
@@ -2081,7 +2400,7 @@ const UI = (function () {
       field("Inspection type", select("type", insp.type, INSPECTION_TYPES)) +
       field("Inspection date", dateField("inspection_date", insp.inspection_date)) +
       field("Next inspection", dateField("next_inspection_date", insp.next_inspection_date)) +
-      field("Inspector (" + esc(st.settings.company_name) + ")", input("inspector_name", insp.inspector_name)) +
+      field("Inspector (" + st.settings.company_name + ")", input("inspector_name", insp.inspector_name)) +
       field("Client / contractor QC", input("client_qc_name", insp.client_qc_name)) +
       "</div></div></div>" +
 
@@ -2096,7 +2415,7 @@ const UI = (function () {
       '<div class="card-b">' + textarea("technical_notes", insp.technical_notes, "Clauses, tolerances, torque notes", 5) + "</div></div>" +
 
       '<div class="card"><div class="card-h"><h2>Project</h2>' +
-      '<button class="btn btn-xs" data-a="edit-project" data-id="' + p.id + '">Edit project</button></div>' +
+      '<button class="btn btn-xs" data-a="edit-project" data-id="' + esc(p.id) + '">Edit project</button></div>' +
       '<div class="card-b muted">' + esc(p.name) + " · " + esc(p.code || "no code") +
       (p.client_name ? " · client " + esc(p.client_name) : "") + (p.location ? " · " + esc(p.location) : "") + "</div></div>" +
 
@@ -2112,22 +2431,22 @@ const UI = (function () {
 
     const pins = pinned.map(function (s) {
       const done = DONE.indexOf(s.status) >= 0;
-      return '<button class="pin r-' + s.risk + (done ? " done" : "") +
-        (App.snagId === s.id ? " sel" : "") + '" style="left:' + (s.pin_x * 100).toFixed(2) +
-        "%;top:" + (s.pin_y * 100).toFixed(2) + '%" data-a="open-snag" data-id="' + s.id + '">' +
-        s.snag_number + "</button>";
+      return '<button class="pin r-' + esc(s.risk) + (done ? " done" : "") +
+        (App.snagId === s.id ? " sel" : "") + '" style="left:' + pct(s.pin_x) +
+        "%;top:" + pct(s.pin_y) + '%" data-a="open-snag" data-id="' + esc(s.id) + '">' +
+        esc(s.snag_number) + "</button>";
     }).join("");
 
     const plan = insp.site_plan_id
       ? '<div class="planwrap' + (App.placing ? " placing" : "") + '" id="planwrap" data-a="plan-tap">' +
-      '<img data-pid="' + insp.site_plan_id + '" alt="Site plan" />' + pins + "</div>"
+      '<img data-pid="' + esc(insp.site_plan_id) + '" alt="Site plan" />' + pins + "</div>"
       : '<div class="planwrap' + (App.placing ? " placing" : "") + '" id="planwrap" data-a="plan-tap" ' +
       'style="min-height:230px;background-image:linear-gradient(#D8E0E8 1px,transparent 1px),linear-gradient(90deg,#D8E0E8 1px,transparent 1px);background-size:34px 34px">' +
       pins + '<div class="empty" style="pointer-events:none">No site plan loaded — pins land on a plain grid</div></div>';
 
     return '<div class="stack">' +
       (App.placing ? '<div class="banner info"><span>◎</span><span><b>Placing pin for snag ' +
-        ((snags.find(function (s) { return s.id === App.pinFor; }) || {}).snag_number || "") +
+        esc((snags.find(function (s) { return s.id === App.pinFor; }) || {}).snag_number || "") +
         "</b>Tap the plan where it is. Tap “Stop placing” to cancel.</span></div>" : "") +
       plan +
       '<div class="btn-row">' +
@@ -2136,12 +2455,12 @@ const UI = (function () {
       (insp.site_plan_id ? '<button class="btn btn-sm btn-d" data-a="clear-photo" data-v="plan">Remove plan</button>' : "") +
       (App.placing ? '<button class="btn btn-sm btn-n" data-a="stop-placing">Stop placing</button>' : "") +
       "</div>" +
-      '<div class="card"><div class="card-h"><h2>Unpinned snags</h2><span class="count">' + unpinned.length + "</span></div>" +
+      '<div class="card"><div class="card-h"><h2>Unpinned snags</h2><span class="count">' + esc(unpinned.length) + "</span></div>" +
       '<div class="card-b">' + (unpinned.length ? unpinned.map(function (s) {
-        return '<button class="row" data-a="place-pin" data-id="' + s.id + '">' +
+        return '<button class="row" data-a="place-pin" data-id="' + esc(s.id) + '">' +
           '<span class="num" style="background:var(--' + (s.risk === "HR" ? "hr" : "lr") + ');color:#fff;font-family:var(--mono);' +
           'min-width:26px;height:22px;border-radius:5px;display:inline-flex;align-items:center;justify-content:center">' +
-          s.snag_number + "</span>" +
+          esc(s.snag_number) + "</span>" +
           '<div class="grow"><b>' + esc(s.description || "(no description)") + "</b>" +
           '<span class="sub">' + esc(s.block_table || s.code) + "</span></div>" +
           '<span class="count">Place</span></button>';
@@ -2156,24 +2475,30 @@ const UI = (function () {
     const revs = Store.get().revisions.filter(function (r) { return r.inspection_id === insp.id; })
       .sort(function (a, b) { return b.rev - a.rev; });
     const t = tally(snagsOf(insp.id));
+    // Photo kinds sit in IndexedDB, so check them after paint and redraw only
+    // if an answer changed; the redraw finds nothing new and stops there.
+    Report.refreshEvidence(insp).then(function (changed) {
+      if (changed && App.route === "inspection" && App.tab === "report" && App.inspId === insp.id) render();
+    }).catch(function (err) { console.error(err); });
 
     return '<div class="stack">' +
       '<div class="banner ' + (pf.ready ? "good" : "bad") + '"><span>' + (pf.ready ? "✓" : "✕") + "</span>" +
       "<span><b>" + (pf.ready ? "Ready to issue" : "Not ready to issue") + "</b>" +
       (pf.ready ? "Everything the report needs is present." : "Fix the items marked ✕ below, then export.") + "</span></div>" +
 
-      '<div class="card"><div class="card-h"><h2>Pre-flight</h2><span class="count">' + t.total + " snags</span></div>" +
+      '<div class="card"><div class="card-h"><h2>Pre-flight</h2><span class="count">' + esc(t.total) + " snags</span></div>" +
       '<div class="card-b">' + pf.checks.map(function (c) {
-        return '<div class="check ' + c.level + '"><span class="m">' +
-          (c.level === "pass" ? "✓" : c.level === "warn" ? "!" : "✕") + "</span><span>" + esc(c.text) +
-          (c.fix ? '<span class="muted" style="display:block">' + esc(c.fix) + "</span>" : "") + "</span></div>";
+        return '<div class="check ' + esc(c.level) + '"><span class="m">' +
+          (c.level === "pass" ? "✓" : c.level === "warn" ? "!" : c.level === "wait" ? "…" : "✕") + "</span><span>" + esc(c.text) +
+          // A hint is how to fix something, so a passing check does not need one.
+          (c.fix && c.level !== "pass" ? '<span class="muted" style="display:block">' + esc(c.fix) + "</span>" : "") + "</span></div>";
       }).join("") + "</div></div>" +
 
-      '<div class="card"><div class="card-h"><h2>Word packs</h2><span class="mono muted">Rev ' + (insp.rev || 0) + "</span></div>" +
+      '<div class="card"><div class="card-h"><h2>Word packs</h2><span class="mono muted">Rev ' + esc(insp.rev || 0) + "</span></div>" +
       '<div class="card-b stack">' +
-      '<button class="btn btn-p" data-a="export" data-v="full">Full report — all ' + t.total + " items</button>" +
-      '<button class="btn" data-a="export" data-v="open">Open items only — ' + t.outstanding + "</button>" +
-      '<button class="btn" data-a="export" data-v="closeout">Close-out pack — ' + t.done + " verified</button>" +
+      '<button class="btn btn-p" data-a="export" data-v="full">Full report — all ' + esc(t.total) + " items</button>" +
+      '<button class="btn" data-a="export" data-v="open">Open items only — ' + esc(t.outstanding) + "</button>" +
+      '<button class="btn" data-a="export" data-v="closeout">Close-out pack — ' + esc(t.done) + " verified</button>" +
       '<button class="btn" data-a="export-csv">CSV register (Excel)</button>' +
       '<p class="muted">Files land in your Downloads folder. Filename: ' +
       '<span class="mono">' + esc(Report.fileBase(insp, "full", insp.rev || 0)) + ".docx</span></p>" +
@@ -2182,8 +2507,8 @@ const UI = (function () {
       '<div class="card"><div class="card-h"><h2>Revisions</h2>' +
       '<button class="btn btn-xs" data-a="new-revision">＋ Issue revision</button></div>' +
       '<div class="card-b">' + (revs.length ? revs.map(function (r) {
-        return '<div class="row" style="cursor:default"><div class="grow"><b>Rev ' + r.rev + " — " + esc(r.reason || "no reason given") + "</b>" +
-          '<span class="sub">' + esc(localStamp(r.created_at)) + " · " + r.snag_count + " items · " + esc(r.by || "") + "</span></div></div>";
+        return '<div class="row" style="cursor:default"><div class="grow"><b>Rev ' + esc(r.rev) + " — " + esc(r.reason || "no reason given") + "</b>" +
+          '<span class="sub">' + esc(localStamp(r.created_at)) + " · " + esc(r.snag_count) + " items · " + esc(r.by || "") + "</span></div></div>";
       }).join("") : '<div class="muted">No revision issued yet. Issuing one stamps the revision number onto the header and footer of the exported Word file.</div>') +
       "</div></div>" +
       "</div>";
@@ -2196,7 +2521,7 @@ const UI = (function () {
       '<div class="card"><div class="card-h"><h2>Snag templates</h2>' +
       '<button class="btn btn-xs" data-a="edit-template" data-id="new">＋ Add</button></div>' +
       '<div class="card-b">' + st.templates.map(function (t) {
-        return '<button class="rail r-' + t.risk + '" data-a="edit-template" data-id="' + t.id + '">' +
+        return '<button class="rail r-' + esc(t.risk) + '" data-a="edit-template" data-id="' + esc(t.id) + '">' +
           '<span class="rh">' + riskTag(t.risk) + '<span class="tag" style="color:var(--ink-3)">' + esc(t.category || "—") + "</span></span>" +
           '<span class="desc">' + esc(t.label) + "</span>" +
           '<span class="meta">' + esc((t.description || "").slice(0, 90)) + "</span></button>";
@@ -2205,7 +2530,7 @@ const UI = (function () {
       '<div class="card"><div class="card-h"><h2>Remarks & technical notes</h2>' +
       '<button class="btn btn-xs" data-a="edit-remark" data-id="new">＋ Add</button></div>' +
       '<div class="card-b">' + st.remarks.map(function (r) {
-        return '<button class="row" data-a="edit-remark" data-id="' + r.id + '">' +
+        return '<button class="row" data-a="edit-remark" data-id="' + esc(r.id) + '">' +
           '<div class="grow"><b>' + esc(r.title) + "</b>" +
           '<span class="sub">' + (r.kind === "remark" ? "Remark" : "Technical note") +
           (r.source ? " · " + esc(r.source) : "") + "</span></div></button>";
@@ -2219,13 +2544,13 @@ const UI = (function () {
   /* ------------------------------------------------------------- settings -- */
   function viewSettings(usage) {
     const s = Store.get().settings;
-    const pct = usage && usage.quota ? Math.min(100, usage.used / usage.quota * 100) : 0;
+    const used = usage && usage.quota ? usage.used / usage.quota : 0;
     return '<div class="stack">' +
       '<div class="card"><div class="card-h"><h2>Storage on this device</h2></div><div class="card-b">' +
-      '<div class="bar"><i class="done" style="width:' + pct.toFixed(2) + '%"></i></div>' +
+      '<div class="bar"><i class="done" style="width:' + pct(used) + '%"></i></div>' +
       '<p class="muted" style="margin:8px 0 0">' +
       (usage ? esc(fmtBytes(usage.used) + " used" + (usage.quota ? " of about " + fmtBytes(usage.quota) + " available" : "")) +
-        " · " + usage.photoCount + " photos (" + esc(fmtBytes(usage.photoBytes)) + ")" : "Measuring…") + "</p>" +
+        " · " + esc(usage.photoCount) + " photos (" + esc(fmtBytes(usage.photoBytes)) + ")" : "Measuring…") + "</p>" +
       '<div class="banner warn" style="margin-top:10px"><span>!</span><span><b>Chrome can clear this</b>' +
       "Clearing site data, or uninstalling the app, deletes every inspection on this device. Export a backup after each site visit.</span></div>" +
       "</div></div>" +
@@ -2238,7 +2563,7 @@ const UI = (function () {
       '<button class="btn btn-p" data-a="backup" data-v="full">Back up everything (with photos)</button>' +
       '<button class="btn" data-a="backup" data-v="light">Back up data only (small, no photos)</button>' +
       '<button class="btn" data-a="restore">Restore from a backup file…</button>' +
-      '<p class="muted">A backup is one .json file. Email it to yourself or drop it in your project folder — that file is the only copy that survives a lost phone.</p>' +
+      '<p class="muted">A full backup is one .zip file; a data-only backup is a small .json. Email it to yourself or drop it in your project folder — that file is the only copy that survives a lost phone. Restore the file as saved; do not unzip it.</p>' +
       "</div></div>" +
 
       '<div class="card"><div class="card-h"><h2>Company & report</h2></div><div class="card-b">' +
@@ -2246,6 +2571,7 @@ const UI = (function () {
       field("Report title", input("s.report_title", s.report_title)) +
       field("Default inspector name", input("s.inspector_name", s.inspector_name)) +
       field("Inspection number prefix", input("s.inspection_prefix", s.inspection_prefix)) +
+      '<p class="muted" style="margin:-4px 0 12px">Give each phone its own prefix (e.g. LUX-A, LUX-B) so two phones never issue the same inspection number.</p>' +
       field("Footer text", input("s.company_footer", s.company_footer)) +
       field("Risk legend", input("s.risk_legend", s.risk_legend)) +
       field("Abbreviation legend", textarea("s.legend", s.legend, "", 3)) +
@@ -2388,7 +2714,7 @@ const UI = (function () {
       '<input class="inp" id="tplq" placeholder="Filter templates" style="margin-bottom:10px" />' +
       '<button class="btn btn-n" data-a="create-snag" data-id="" style="width:100%;margin-bottom:10px">Blank snag</button>' +
       '<div id="tpllist">' + list.map(function (t) {
-        return '<button class="rail r-' + t.risk + '" data-a="create-snag" data-id="' + t.id + '" data-label="' +
+        return '<button class="rail r-' + esc(t.risk) + '" data-a="create-snag" data-id="' + esc(t.id) + '" data-label="' +
           esc((t.label + " " + t.description + " " + t.category).toLowerCase()) + '">' +
           '<span class="rh">' + UI.riskTag(t.risk) +
           '<span class="tag" style="color:var(--ink-3)">' + esc(t.category || "—") + "</span></span>" +
@@ -2413,15 +2739,18 @@ const UI = (function () {
     const done = DONE.indexOf(s.status) >= 0;
 
     const photos = (s.photos || []).map(function (pid) {
-      return '<div class="photocell"><img data-pid="' + pid + '" alt="" data-a="view-photo" data-id="' + pid + '" />' +
-        '<span class="k" data-a="cycle-kind" data-id="' + pid + '">…</span>' +
-        '<button class="x" data-a="del-photo" data-id="' + pid + '" title="Remove photo">×</button></div>';
+      // The kind label sits beside the photo button, not inside it, so tapping
+      // the label only changes the kind and never opens the viewer.
+      return '<div class="photocell"><button type="button" class="ph" data-a="view-photo" data-id="' + esc(pid) + '" aria-label="View photo">' +
+        '<img data-pid="' + esc(pid) + '" alt="" /></button>' +
+        '<button type="button" class="k" data-a="cycle-kind" data-id="' + esc(pid) + '" title="Change photo kind">…</button>' +
+        '<button class="x" data-a="del-photo" data-id="' + esc(pid) + '" title="Remove photo">×</button></div>';
     }).join("");
 
     const refs = (s.references || []).map(function (r, i) {
       return '<div class="row" style="cursor:default"><div class="grow"><b>' + esc(r.document || "—") + "</b>" +
         '<span class="sub">' + esc(r.detail || "") + "</span></div>" +
-        '<button class="btn btn-xs btn-d" data-a="del-ref" data-v="' + i + '">Remove</button></div>';
+        '<button class="btn btn-xs btn-d" data-a="del-ref" data-v="' + esc(i) + '">Remove</button></div>';
     }).join("");
 
     const statusBtns = [
@@ -2431,7 +2760,7 @@ const UI = (function () {
       ["open", "Reopen", ""],
     ].filter(function (b) { return b[0] !== s.status; })
       .map(function (b) {
-        return '<button class="btn btn-sm ' + b[2] + '" data-a="set-status" data-v="' + b[0] + '">' + b[1] + "</button>";
+        return '<button class="btn btn-sm ' + esc(b[2]) + '" data-a="set-status" data-v="' + esc(b[0]) + '">' + esc(b[1]) + "</button>";
       }).join("");
 
     const history = (s.history || []).slice().reverse().map(function (h) {
@@ -2441,7 +2770,7 @@ const UI = (function () {
     }).join("");
 
     UI.openModal(
-      '<div class="sheet-h"><h2>Snag ' + s.snag_number + "</h2>" +
+      '<div class="sheet-h"><h2>Snag ' + esc(s.snag_number) + "</h2>" +
       UI.riskTag(s.risk) + UI.statusTag(s.status) +
       '<button class="btn btn-sm" data-a="close-modal">Done</button></div>' +
       '<div class="sheet-b">' +
@@ -2477,12 +2806,12 @@ const UI = (function () {
       '<div class="btn-row" style="margin-bottom:8px">' +
       '<button class="btn btn-sm" data-a="gps">' + (s.lat != null ? "Update GPS" : "Capture GPS") + "</button>" +
       '<button class="btn btn-sm" data-a="enter-gps">Enter coordinates</button>' +
-      '<button class="btn btn-sm" data-a="place-pin" data-id="' + s.id + '">' + (s.pin_x != null ? "Move pin" : "Place pin on plan") + "</button>" +
+      '<button class="btn btn-sm" data-a="place-pin" data-id="' + esc(s.id) + '">' + (s.pin_x != null ? "Move pin" : "Place pin on plan") + "</button>" +
       (s.pin_x != null ? '<button class="btn btn-sm btn-d" data-a="clear-pin">Clear pin</button>' : "") +
       "</div>" +
       '<div class="muted mono">' +
-      (s.lat != null ? "GPS " + Number(s.lat).toFixed(6) + ", " + Number(s.lng).toFixed(6) +
-        (s.gps_accuracy ? " ±" + Math.round(s.gps_accuracy) + "m" : "") : "No GPS captured") +
+      (s.lat != null ? esc("GPS " + Number(s.lat).toFixed(6) + ", " + Number(s.lng).toFixed(6) +
+        (s.gps_accuracy ? " ±" + Math.round(s.gps_accuracy) + "m" : "")) : "No GPS captured") +
       (s.pin_x != null ? " · pin set" : " · no pin") + "</div></div></div>" +
 
       (history ? '<div class="card" style="margin-bottom:12px"><div class="card-h"><h2>History</h2></div>' +
@@ -2499,7 +2828,7 @@ const UI = (function () {
     // Show each photo's kind label.
     (s.photos || []).forEach(function (pid) {
       Store.getPhoto(pid).then(function (p) {
-        const el = document.querySelector('.k[data-id="' + pid + '"]');
+        const el = document.querySelector('.k[data-id="' + CSS.escape(pid) + '"]');
         if (el && p) el.textContent = p.kind === "closeout" ? "Close-out" : p.kind === "after" ? "After" : "Before";
       });
     });
@@ -2557,7 +2886,7 @@ const UI = (function () {
     const list = Store.get().remarks.filter(function (r) { return r.kind === kind; });
     UI.openModal(UI.sheetHead(kind === "remark" ? "Insert general remark" : "Insert technical note") +
       '<div class="sheet-b">' + (list.length ? list.map(function (r) {
-        return '<button class="row" data-a="use-remark" data-id="' + r.id + '"><div class="grow"><b>' +
+        return '<button class="row" data-a="use-remark" data-id="' + esc(r.id) + '"><div class="grow"><b>' +
           esc(r.title) + "</b><span class=\"sub\">" + esc((r.body || "").slice(0, 70)) + "…</span></div></button>";
       }).join("") : '<div class="empty">Nothing in the library for this yet.</div>') + "</div>");
   }
@@ -2715,7 +3044,7 @@ const UI = (function () {
     for (let d = 1; d <= days; d++) {
       const v = ymd(y, mo, d);
       const cls = (value === v ? " on" : "") + (todayStr === v ? " today" : "");
-      cells += '<button type="button" class="' + cls.trim() + '" data-a="pick-date" data-v="' + v + '">' + d + "</button>";
+      cells += '<button type="button" class="' + cls.trim() + '" data-a="pick-date" data-v="' + esc(v) + '">' + d + "</button>";
     }
     const title = field === "due_date" ? "Due date" : field === "next_inspection_date" ? "Next inspection" : "Inspection date";
     UI.openModal(
@@ -2723,7 +3052,7 @@ const UI = (function () {
       '<div class="sheet-b">' +
       '<div class="cal-nav">' +
       '<button class="btn btn-sm" data-a="date-prev">‹</button>' +
-      "<b>" + months[mo] + " " + y + "</b>" +
+      "<b>" + esc(months[mo] + " " + y) + "</b>" +
       '<button class="btn btn-sm" data-a="date-next">›</button></div>' +
       '<div class="cal">' + cells + "</div>" +
       '<div class="btn-row" style="margin-top:12px">' +
@@ -3026,7 +3355,7 @@ const UI = (function () {
       const fromSnag = App.modal && App.modal.type === "snag";
       if (!fromSnag) App.modal = { type: "photo", id: pid };   // so Escape closes it
       UI.openModal(UI.sheetHead("Photo") + '<div class="sheet-b">' +
-        '<img src="' + url + '" style="width:100%;border-radius:9px" alt="" />' +
+        '<img src="' + esc(url) + '" style="width:100%;border-radius:9px" alt="" />' +
         UI.field("Caption", UI.input("ph." + pid, (p && p.caption) || "", { placeholder: "Shown under the photo in the report" })) +
         (fromSnag ? '<button class="btn" data-a="back-to-snag">Back to snag</button>'
           : '<button class="btn" data-a="close-modal">Done</button>') + "</div>");
@@ -3115,7 +3444,6 @@ const UI = (function () {
       App.busy = true;
       UI.toast("Building the Word file…", false, 20000);
       try {
-        await Report.annotate(i);
         const blob = await Report.buildDocx(i, mode, i.rev || 0);
         saveBlob(blob, Report.fileBase(i, mode, i.rev || 0) + ".docx");
         UI.toast("Downloaded " + fmtBytes(blob.size));
@@ -3151,7 +3479,7 @@ const UI = (function () {
       UI.toast("Preparing backup…", false, 20000);
       try {
         const blob = await Store.backup(withPhotos);
-        const name = "LumaxPunchList_backup_" + today() + (withPhotos ? "_full" : "_data") + ".json";
+        const name = "LumaxPunchList_backup_" + today() + (withPhotos ? "_full.zip" : "_data.json");
         saveBlob(blob, name);
         UI.toast("Backup saved · " + fmtBytes(blob.size));
       } catch (err) {
@@ -3159,21 +3487,29 @@ const UI = (function () {
       }
     },
     "restore": async function () {
-      const files = await pickFile("application/json,.json", false);
+      const files = await pickFile(".json,.zip,application/json,application/zip", false);
       if (!files.length) return;
       if (!confirm("Restore this backup into this device?\n\nCancel stops. Nothing will change.")) return;
       const mode = confirm("OK = replace everything here with the backup (photos it still uses are kept)\nCancel = merge, keeping what is already here") ? "replace" : "merge";
       try {
-        const text = await files[0].text();
-        const res = await Store.restore(JSON.parse(text), mode);
+        const opened = await Store.openBackup(files[0]);
+        const res = await Store.restore(opened.json, mode, opened.files);
         UI.clearUsage();
         App.route = "home"; App.inspId = null;
         UI.render();
+        let msg = "Backup restored";
+        // Say which numbers changed, so a report already sent under the old
+        // number can still be matched up.
+        const rn = res.renumbered || [];
+        if (rn.length) {
+          msg += " · " + rn.length + " inspection" + (rn.length > 1 ? "s" : "") + " renumbered: " +
+            rn.map(function (r) { return r.from + " → " + r.to; }).join(", ");
+        }
         if (res.missingPhotos) {
-          UI.toast("Backup restored · " + res.missingPhotos + " photo" + (res.missingPhotos > 1 ? "s are" : " is") +
+          UI.toast(msg + " · " + res.missingPhotos + " photo" + (res.missingPhotos > 1 ? "s are" : " is") +
             " not on this device. Restore a full backup to bring them back.", true, 9000);
         } else {
-          UI.toast("Backup restored");
+          UI.toast(msg, false, rn.length ? 9000 : 2600);
         }
       } catch (err) {
         UI.toast("Restore failed: " + (err.message || err), true, 8000);
@@ -3243,7 +3579,7 @@ const UI = (function () {
       s[name] = value;
       s.updated_at = new Date().toISOString();
       if (name === "description" || name === "block_table") {
-        const row = document.querySelector('[data-a="open-snag"][data-id="' + s.id + '"] .desc');
+        const row = document.querySelector('[data-a="open-snag"][data-id="' + CSS.escape(s.id) + '"] .desc');
         if (row && name === "description") row.textContent = value || "(no description yet)";
       }
     } else {
