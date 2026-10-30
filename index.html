@@ -881,6 +881,17 @@ const Store = (function () {
       r.onerror = function () { rej(r.error); };
     });
   }
+  /** Like idbPut, but resolves only once the transaction has committed. A
+   *  request can succeed and its transaction still abort (disk full), so a
+   *  restore counts a photo as written only after this. */
+  function idbPutDone(store, value) {
+    return new Promise(function (res, rej) {
+      const t = db.transaction(store, "readwrite");
+      t.objectStore(store).put(value);
+      t.oncomplete = function () { res(true); };
+      t.onabort = t.onerror = function () { rej(t.error || new Error("Could not save a photo.")); };
+    });
+  }
   function idbDel(store, key) {
     return new Promise(function (res, rej) {
       const r = tx(store, "readwrite").delete(key);
@@ -1560,41 +1571,59 @@ const Store = (function () {
       throw new Error("That file is not a Lumax Punch List backup.");
     }
     const incoming = migrate(json.state || {});
-    // Decode every photo before anything here changes, so a damaged file
+    // Check every photo before anything here changes, so a damaged file
     // fails cleanly instead of half way through.
     // Photo ids end up in attributes and the thumb in an img src, so they
     // get the same type checks as the state.
     // A size must be a positive number: the Word export divides by it.
     const size = function (v) { const n = asNum(v); return n > 0 ? n : null; };
+    // Only the photo details are kept here, not the bytes: a zip photo is
+    // read once to check it and read again when it is saved, so a phone
+    // never holds the whole photo library in memory at once.
     const photos = [];
     let skipped = 0;
     for (const p of (Array.isArray(json.photos) ? json.photos : [])) {
       if (!isObj(p) || p.id == null || p.id === "") continue;
-      let blob;
+      let part = null;
+      let blob = null;
       if (p.file != null && p.file !== "") {
         // backup.json on its own: the phone or computer unzipped the backup
         // and kept only the folder. Restore the data; the photos show up as
         // missing rather than blocking everything else.
         if (!files) { skipped++; continue; }
-        const part = files.get(String(p.file));
+        part = files.get(String(p.file));
         if (!part) throw new Error("The backup is missing the photo file " + p.file + ".");
-        // Read and check each photo now, one at a time, and keep a copy of
-        // its bytes: damaged bytes never replace a good photo here, and the
-        // save does not depend on the picked file still being readable.
+        // Read and check each photo now, one at a time, then let the bytes
+        // go: damaged bytes never replace a good photo here.
         const bytes = await toBytes(part.blob);
         if (!bytes || DocxKit.crc32(bytes) !== part.crc) throw new Error(ZIP_DAMAGED);
-        blob = new Blob([bytes], { type: "image/jpeg" });
       } else {
         blob = b64ToBlob(p.data, "image/jpeg");
       }
       photos.push({
-        id: String(p.id), blob: blob,
+        id: String(p.id), part: part, blob: blob,
         thumb: typeof p.thumb === "string" && p.thumb.indexOf("data:image/") === 0 ? p.thumb : null,
         w: size(p.w), h: size(p.h),
         kind: p.kind === "after" || p.kind === "closeout" ? p.kind : "before",
         caption: p.caption == null ? "" : String(p.caption), created_at: p.created_at == null ? "" : String(p.created_at),
       });
     }
+    // The stored record for one photo. A zip photo is read again and copied
+    // into its own Blob, so the saved photo does not depend on the picked
+    // file staying readable. It is checked again too, in case the file
+    // changed since the first pass.
+    const record = async function (m) {
+      let blob = m.blob;
+      if (m.part) {
+        const bytes = await toBytes(m.part.blob);
+        if (!bytes || DocxKit.crc32(bytes) !== m.part.crc) throw new Error(ZIP_DAMAGED);
+        blob = new Blob([bytes], { type: "image/jpeg" });
+      }
+      return {
+        id: m.id, blob: blob, thumb: m.thumb, w: m.w, h: m.h,
+        kind: m.kind, caption: m.caption, created_at: m.created_at,
+      };
+    };
     // Add the backup's new photos before deleting or changing any. If anything
     // fails before the restored state is saved, the ones added are removed
     // again, so the device is left exactly as it was.
@@ -1607,7 +1636,9 @@ const Store = (function () {
           if (mode === "replace") overwrite.push(p);
           continue;
         }
-        await idbPut("photos", p);
+        // One photo at a time: read, save, and wait for the save to commit
+        // before the next is read.
+        await idbPutDone("photos", await record(p));
         added.push(p.id);
       }
       renumbered = await commitRestore(incoming, mode);
@@ -1615,7 +1646,9 @@ const Store = (function () {
       for (const id of added) { try { await idbDel("photos", id); } catch (e) { } }
       throw err;
     }
-    for (const p of overwrite) { try { await idbPut("photos", p); } catch (e) { } }
+    // The data is saved now, so a photo that cannot be read again keeps the
+    // copy already on this device rather than undoing the restore.
+    for (const p of overwrite) { try { await idbPutDone("photos", await record(p)); } catch (e) { } }
 
     // Only now drop photos the restored data no longer uses. A data-only
     // backup carries no photos, so the ones it still points at stay.
