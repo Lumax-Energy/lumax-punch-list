@@ -97,6 +97,7 @@ main{flex:1;padding:12px 12px 96px;max-width:1500px;width:100%;margin:0 auto}
 .btn[disabled]{opacity:.45;pointer-events:none}
 .btn-row{display:flex;gap:8px;flex-wrap:wrap}
 .btn-row>.btn{flex:1 1 auto}
+.btn-row>.btn-share{flex:0 0 auto}
 .fab{
   position:fixed;right:14px;bottom:calc(env(safe-area-inset-bottom,0px) + 74px);z-index:35;
   height:58px;padding:0 20px;border-radius:29px;background:var(--steel);color:#fff;
@@ -2158,6 +2159,43 @@ function saveBlob(blob, filename) {
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
 }
+
+// A shared file needs a plain MIME type: Chrome refuses "text/csv;charset=…",
+// and the share sheet picks apps (Word, Excel, Drive) by it.
+const SHARE_MIME = {
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  csv: "text/csv", zip: "application/zip", json: "application/json",
+};
+function fileFor(blob, filename) {
+  const ext = filename.split(".").pop().toLowerCase();
+  return new File([blob], filename, { type: SHARE_MIME[ext] || blob.type || "application/octet-stream" });
+}
+
+/** True when this browser can hand a file like `filename` to the phone's share
+ *  sheet. Browsers allow different file types, so it is asked per type. */
+function canShareFile(filename) {
+  try {
+    return !!(navigator.canShare && navigator.share &&
+      navigator.canShare({ files: [fileFor(new Blob([]), filename)] }));
+  } catch (err) {
+    return false;
+  }
+}
+
+/** Send a file through the share sheet (mail, WhatsApp, Drive…). Resolves
+ *  "shared", "cancelled" or "downloaded": any failure other than the user
+ *  backing out falls back to a normal download, so the file is never lost. */
+async function shareBlob(blob, filename) {
+  try {
+    await navigator.share({ files: [fileFor(blob, filename)], title: filename });
+    return "shared";
+  } catch (err) {
+    if (err && err.name === "AbortError") return "cancelled";
+    console.warn("Share failed, downloading instead", err);
+    saveBlob(blob, filename);
+    return "downloaded";
+  }
+}
 /* ============================================================================
    Views. Every screen is a string of HTML; buttons carry data-a="action" and
    are handled by one delegated listener in app.js. Small, predictable, and it
@@ -2179,6 +2217,20 @@ const UI = (function () {
     el.className = "toast show" + (bad ? " bad" : "");
     clearTimeout(toastTimer);
     toastTimer = setTimeout(function () { el.className = "toast" + (bad ? " bad" : ""); }, ms || 2600);
+  }
+  // Clears a long "Building…" toast when there is nothing to say after it.
+  function hideToast() {
+    clearTimeout(toastTimer);
+    document.getElementById("toast").className = "toast";
+  }
+
+  /** A download button, with a "Share…" button beside it when this browser can
+   *  share that kind of file. `attrs` are the download button's data-a/data-v;
+   *  the share button repeats them with data-share, so one action does both. */
+  function withShare(btn, attrs, filename, what) {
+    if (!canShareFile(filename)) return btn;
+    return '<div class="btn-row">' + btn +
+      '<button class="btn btn-share" ' + attrs + ' data-share="1" aria-label="Share ' + esc(what) + '">Share…</button></div>';
   }
 
   const tag = function (cls, txt) { return '<span class="tag ' + esc(cls) + '">' + esc(txt) + "</span>"; };
@@ -2540,11 +2592,16 @@ const UI = (function () {
 
       '<div class="card"><div class="card-h"><h2>Word packs</h2><span class="mono muted">Rev ' + esc(insp.rev || 0) + "</span></div>" +
       '<div class="card-b stack">' +
-      '<button class="btn btn-p" data-a="export" data-v="full">Full report — all ' + esc(t.total) + " items</button>" +
-      '<button class="btn" data-a="export" data-v="open">Open items only — ' + esc(t.outstanding) + "</button>" +
-      '<button class="btn" data-a="export" data-v="closeout">Close-out pack — ' + esc(t.done) + " verified</button>" +
-      '<button class="btn" data-a="export-csv">CSV register (Excel)</button>' +
-      '<p class="muted">Files land in your Downloads folder. Filename: ' +
+      withShare('<button class="btn btn-p" data-a="export" data-v="full">Full report — all ' + esc(t.total) + " items</button>",
+        'data-a="export" data-v="full"', "x.docx", "full report") +
+      withShare('<button class="btn" data-a="export" data-v="open">Open items only — ' + esc(t.outstanding) + "</button>",
+        'data-a="export" data-v="open"', "x.docx", "open items report") +
+      withShare('<button class="btn" data-a="export" data-v="closeout">Close-out pack — ' + esc(t.done) + " verified</button>",
+        'data-a="export" data-v="closeout"', "x.docx", "close-out pack") +
+      withShare('<button class="btn" data-a="export-csv">CSV register (Excel)</button>',
+        'data-a="export-csv"', "x.csv", "CSV register") +
+      '<p class="muted">Files land in your Downloads folder' +
+      (canShareFile("x.docx") ? "; Share… sends one straight to mail, WhatsApp or Drive" : "") + ". Filename: " +
       '<span class="mono">' + esc(Report.fileBase(insp, "full", insp.rev || 0)) + ".docx</span></p>" +
       "</div></div>" +
 
@@ -2612,8 +2669,10 @@ const UI = (function () {
       '<p style="margin:0">Last backup: ' + (s.last_backup_at
         ? "<b>" + esc(localStamp(s.last_backup_at, true)) + "</b> (" + (s.last_backup_full ? "full" : "data only") + ")"
         : "<b>never</b>") + "</p>" +
-      '<button class="btn btn-p" data-a="backup" data-v="full">Back up everything (with photos)</button>' +
-      '<button class="btn" data-a="backup" data-v="light">Back up data only (small, no photos)</button>' +
+      withShare('<button class="btn btn-p" data-a="backup" data-v="full">Back up everything (with photos)</button>',
+        'data-a="backup" data-v="full"', "x.zip", "full backup") +
+      withShare('<button class="btn" data-a="backup" data-v="light">Back up data only (small, no photos)</button>',
+        'data-a="backup" data-v="light"', "x.json", "data-only backup") +
       '<button class="btn" data-a="restore">Restore from a backup file…</button>' +
       '<p class="muted">A full backup is one .zip file; a data-only backup is a small .json. Email it to yourself or drop it in your project folder — that file is the only copy that survives a lost phone. Restore the file as saved; do not unzip it.</p>' +
       "</div></div>" +
@@ -2704,7 +2763,7 @@ const UI = (function () {
   }
 
   return {
-    toast: toast, render: render, hydrate: hydrate, chrome: chrome,
+    toast: toast, hideToast: hideToast, render: render, hydrate: hydrate, chrome: chrome,
     openModal: openModal, closeModal: closeModal, sheetHead: sheetHead,
     field: field, input: input, dateField: dateField, textarea: textarea, select: select, seg: seg,
     riskTag: riskTag, statusTag: statusTag, snagRow: snagRow, bar: bar,
@@ -3492,23 +3551,30 @@ const UI = (function () {
     "export": async function (el) {
       if (App.busy) return;
       const mode = el.getAttribute("data-v");
+      const share = el.hasAttribute("data-share");
       const i = insp();
       App.busy = true;
       UI.toast("Building the Word file…", false, 20000);
       try {
         const blob = await Report.buildDocx(i, mode, i.rev || 0);
-        saveBlob(blob, Report.fileBase(i, mode, i.rev || 0) + ".docx");
-        UI.toast("Downloaded " + fmtBytes(blob.size));
+        const name = Report.fileBase(i, mode, i.rev || 0) + ".docx";
+        let how = "downloaded";
+        if (share) how = await shareBlob(blob, name);
+        else saveBlob(blob, name);
+        if (how === "cancelled") UI.hideToast();
+        else UI.toast((how === "shared" ? "Shared " : "Downloaded ") + fmtBytes(blob.size));
       } catch (err) {
         console.error(err);
         UI.toast("Export failed: " + (err.message || err), true, 8000);
       }
       App.busy = false;
     },
-    "export-csv": function () {
+    "export-csv": async function (el) {
       const i = insp();
-      saveBlob(Report.buildCsv(i, "full"), Report.fileBase(i, "full", i.rev || 0) + ".csv");
-      UI.toast("CSV downloaded");
+      const blob = Report.buildCsv(i, "full"), name = Report.fileBase(i, "full", i.rev || 0) + ".csv";
+      if (!el.hasAttribute("data-share")) { saveBlob(blob, name); UI.toast("CSV downloaded"); return; }
+      const how = await shareBlob(blob, name);
+      if (how !== "cancelled") UI.toast(how === "shared" ? "CSV shared" : "CSV downloaded");
     },
     "new-revision": function () {
       const i = insp(), st = Store.get();
@@ -3532,7 +3598,11 @@ const UI = (function () {
       try {
         const blob = await Store.backup(withPhotos);
         const name = "LumaxPunchList_backup_" + today() + (withPhotos ? "_full.zip" : "_data.json");
-        saveBlob(blob, name);
+        let how = "downloaded";
+        if (el.hasAttribute("data-share")) how = await shareBlob(blob, name);
+        else saveBlob(blob, name);
+        // Backing out of the share sheet saved nothing, so it is not a backup.
+        if (how === "cancelled") return UI.hideToast();
         const s = Store.get().settings;
         s.last_backup_full = withPhotos;
         Store.save();
@@ -3541,7 +3611,7 @@ const UI = (function () {
         // is debounced, so it still carries the value set here.
         s.last_backup_at = Store.get().updated_at;
         UI.render();
-        UI.toast("Backup saved · " + fmtBytes(blob.size));
+        UI.toast((how === "shared" ? "Backup shared · " : "Backup saved · ") + fmtBytes(blob.size));
       } catch (err) {
         UI.toast("Backup failed: " + (err.message || err), true, 7000);
       }
