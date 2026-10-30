@@ -39,6 +39,9 @@ body{
 }
 button,input,select,textarea{font:inherit;color:inherit}
 button{cursor:pointer}
+/* iOS Safari only sends taps on a span/div/img to the click handler when the
+   element has a pointer cursor, so give every data-a target one. */
+[data-a]{cursor:pointer}
 h1,h2,h3{margin:0;font-weight:700;letter-spacing:-.01em}
 a{color:var(--steel)}
 .hide{display:none !important}
@@ -203,7 +206,14 @@ textarea.inp{min-height:82px;resize:vertical;line-height:1.4}
 .photocell .k{
   position:absolute;left:4px;top:4px;font-size:9.5px;font-weight:800;letter-spacing:.08em;
   text-transform:uppercase;background:rgba(15,48,74,.86);color:#fff;padding:2px 5px;border-radius:4px;
+  border:0;margin:0;-webkit-appearance:none;appearance:none;
 }
+/* A plain button around a photo so it can be tapped and reached by keyboard
+   without changing how the photo looks. */
+.ph{display:block;width:100%;padding:0;margin:0;border:0;background:none;border-radius:9px;
+  -webkit-appearance:none;appearance:none;text-align:left}
+.ph:focus-visible{outline:3px solid #7FB3D0;outline-offset:-3px}
+.photocell .k:focus-visible{outline:3px solid #7FB3D0;outline-offset:1px}
 .photocell .x{
   position:absolute;right:3px;top:3px;width:34px;height:34px;border-radius:17px;border:0;
   background:rgba(180,35,24,.92);color:#fff;font-size:15px;line-height:1;font-weight:700;
@@ -218,6 +228,8 @@ textarea.inp{min-height:82px;resize:vertical;line-height:1.4}
   border-radius:var(--r);overflow:hidden;touch-action:manipulation}
 .planwrap img{width:100%;display:block}
 .planwrap.placing{outline:3px solid var(--steel);outline-offset:-3px;cursor:crosshair}
+/* Touch screens show no cursor, and iOS needs a pointer one to send the tap. */
+@media (hover:none){.planwrap.placing{cursor:pointer}}
 .pin{
   position:absolute;transform:translate(-50%,-50%);width:28px;height:28px;border-radius:14px;
   border:2.5px solid #fff;color:#fff;font-family:var(--mono);font-size:12px;font-weight:700;
@@ -2370,7 +2382,8 @@ const UI = (function () {
     const st = Store.get();
     const p = projectOf(insp);
     const cover = insp.site_photo_id
-      ? '<img data-pid="' + esc(insp.site_photo_id) + '" data-a="view-photo" data-id="' + esc(insp.site_photo_id) + '" style="width:100%;border-radius:9px;border:1px solid var(--line)" alt="Site cover photo — tap to add a caption" />' +
+      ? '<button type="button" class="ph" data-a="view-photo" data-id="' + esc(insp.site_photo_id) + '">' +
+      '<img data-pid="' + esc(insp.site_photo_id) + '" style="width:100%;border-radius:9px;border:1px solid var(--line)" alt="Site cover photo — tap to add a caption" /></button>' +
       '<div class="btn-row" style="margin-top:8px"><button class="btn btn-sm" data-a="pick-photo" data-v="site">Library</button>' +
       '<button class="btn btn-sm" data-a="take-photo" data-v="site">Camera</button>' +
       '<button class="btn btn-sm btn-d" data-a="clear-photo" data-v="site">Remove</button></div>'
@@ -2726,8 +2739,11 @@ const UI = (function () {
     const done = DONE.indexOf(s.status) >= 0;
 
     const photos = (s.photos || []).map(function (pid) {
-      return '<div class="photocell"><img data-pid="' + esc(pid) + '" alt="" data-a="view-photo" data-id="' + esc(pid) + '" />' +
-        '<span class="k" data-a="cycle-kind" data-id="' + esc(pid) + '">…</span>' +
+      // The kind label sits beside the photo button, not inside it, so tapping
+      // the label only changes the kind and never opens the viewer.
+      return '<div class="photocell"><button type="button" class="ph" data-a="view-photo" data-id="' + esc(pid) + '" aria-label="View photo">' +
+        '<img data-pid="' + esc(pid) + '" alt="" /></button>' +
+        '<button type="button" class="k" data-a="cycle-kind" data-id="' + esc(pid) + '" title="Change photo kind">…</button>' +
         '<button class="x" data-a="del-photo" data-id="' + esc(pid) + '" title="Remove photo">×</button></div>';
     }).join("");
 
