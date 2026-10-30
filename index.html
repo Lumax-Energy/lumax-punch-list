@@ -260,6 +260,9 @@ textarea.inp{min-height:82px;resize:vertical;line-height:1.4}
 .banner.good{background:#E6F5EE;border-color:#96CDB4;color:#065E3B}
 .banner.info{background:#EAF2F8;border-color:#9EC2D8;color:#12435F}
 .banner b{display:block}
+.stale{position:fixed;inset:0;z-index:100;background:rgba(10,26,40,.62);display:flex;
+  align-items:center;justify-content:center;padding:16px}
+.stale .banner{max-width:420px;box-shadow:var(--shadow)}
 
 /* ── preflight ─────────────────────────────────────────────────────────── */
 .check{display:flex;gap:9px;align-items:flex-start;padding:8px 0;border-bottom:1px solid var(--band);font-size:13.5px}
@@ -806,7 +809,10 @@ const Store = (function () {
   "use strict";
   let db = null;
   let saveTimer = null;
-  let savingPromise = null;
+  let saveWaiters = [];           // callers of save() still waiting on the debounced write
+  let writeId = null;             // stamp of the state record this tab last read or wrote
+  let stale = false;              // another tab has the data now; this tab must not write
+  let staleHandler = null;
 
   function open() {
     return new Promise(function (res, rej) {
@@ -852,6 +858,20 @@ const Store = (function () {
       r.onerror = function () { rej(r.error); };
     });
   }
+  function idbHas(store, key) {
+    return new Promise(function (res, rej) {
+      const r = tx(store, "readonly").count(key);
+      r.onsuccess = function () { res(r.result > 0); };
+      r.onerror = function () { rej(r.error); };
+    });
+  }
+  function idbKeys(store) {
+    return new Promise(function (res, rej) {
+      const r = tx(store, "readonly").getAllKeys();
+      r.onsuccess = function () { res(r.result || []); };
+      r.onerror = function () { rej(r.error); };
+    });
+  }
 
   /* ------------------------------------------------------------- state --- */
   function blank() {
@@ -875,9 +895,10 @@ const Store = (function () {
     const saved = await idbGet("kv", "state");
     if (saved) {
       state = migrate(saved);
+      writeId = saved.write_id || null;
     } else {
       // First run on this device, or a fresh browser profile.
-      await idbPut("kv", state, "state");
+      await write();
     }
     return state;
   }
@@ -909,27 +930,84 @@ const Store = (function () {
 
   function get() { return state; }
 
+  /** Write the whole state, but only if the stored record is still the one
+   *  this tab last read or wrote. Each open tab holds its own full copy, so a
+   *  blind put from an out-of-date tab would erase another tab's work. */
+  function write() {
+    if (stale) return Promise.reject(new Error("This data is open in another tab."));
+    return new Promise(function (res, rej) {
+      const t = db.transaction("kv", "readwrite");
+      const kv = t.objectStore("kv");
+      const id = uid();
+      let done = false;
+      const r = kv.get("state");
+      r.onsuccess = function () {
+        const cur = r.result;
+        if (cur && (cur.write_id || null) !== writeId) {
+          stale = true;
+          t.abort();
+          return;
+        }
+        state.write_id = id;
+        kv.put(state, "state");
+      };
+      t.oncomplete = function () { done = true; writeId = id; res(true); };
+      t.onabort = t.onerror = function () {
+        if (done) return;
+        done = true;
+        if (stale) {
+          if (staleHandler) staleHandler();
+          rej(new Error("This data was changed in another tab."));
+        } else {
+          rej(t.error || r.error || new Error("The save did not complete."));
+        }
+      };
+    });
+  }
+
+  function runSave() {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+    const waiters = saveWaiters;
+    saveWaiters = [];
+    return write().then(function (v) {
+      waiters.forEach(function (w) { w.res(v); });
+      return v;
+    }, function (err) {
+      waiters.forEach(function (w) { w.rej(err); });
+      throw err;
+    });
+  }
+
   /** Debounced write. Returns a promise that resolves when the write lands. */
   function save() {
     state.updated_at = new Date().toISOString();
     clearTimeout(saveTimer);
-    savingPromise = new Promise(function (res, rej) {
-      saveTimer = setTimeout(function () {
-        idbPut("kv", state, "state").then(function () { res(true); }).catch(function (err) {
-          // A failed save is the one thing the user must never miss.
-          UI.toast("Could not save to this device: " + (err && err.message ? err.message : err), true, 8000);
-          rej(err);
-        });
-      }, 220);
-    });
-    savingPromise.catch(function () { });
-    return savingPromise;
+    const p = new Promise(function (res, rej) { saveWaiters.push({ res: res, rej: rej }); });
+    p.catch(function () { });
+    saveTimer = setTimeout(function () {
+      runSave().catch(function (err) {
+        // A failed save is the one thing the user must never miss.
+        if (!stale) UI.toast("Could not save to this device: " + (err && err.message ? err.message : err), true, 8000);
+      });
+    }, 220);
+    return p;
   }
 
   function flush() {
-    clearTimeout(saveTimer);
-    return idbPut("kv", state, "state");
+    return runSave();
   }
+
+  /** Another tab is taking over: save what is pending here, then stop
+   *  writing. Resolves to whether that last save landed. */
+  async function release() {
+    let ok = true;
+    try { await flush(); } catch (e) { ok = false; }
+    stale = true;
+    return ok;
+  }
+
+  function onStale(fn) { staleHandler = fn; }
 
   /* ------------------------------------------------------------ photos --- */
   /** Downscale through a canvas, store the Blob, keep width/height for Word. */
@@ -1044,44 +1122,88 @@ const Store = (function () {
     return new Blob([JSON.stringify(payload)], { type: "application/json" });
   }
 
-  async function restore(json, mode) {
-    if (!json || json.format !== "lumax-punchlist-backup") {
-      throw new Error("That file is not a Lumax Punch List backup.");
-    }
-    const incoming = migrate(json.state || {});
+  /** Swap in the restored state and save it. On failure the state in
+   *  memory is put back, so a later save cannot write a half restore. */
+  async function commitRestore(incoming, mode) {
+    let next;
     if (mode === "replace") {
-      const existingPhotos = await idbAll("photos");
-      for (const p of existingPhotos) {
-        try { await idbDel("photos", p.id); } catch (e) { }
-      }
-      urlCache.forEach(function (u) { URL.revokeObjectURL(u); });
-      urlCache.clear();
-      state = incoming;
+      next = incoming;
     } else {
       // Merge: keep everything already here, add what is missing by id.
-      const merge = function (key, idKey) {
-        const have = new Set(state[key].map(function (x) { return x[idKey || "id"]; }));
-        incoming[key].forEach(function (x) { if (!have.has(x[idKey || "id"])) state[key].push(x); });
-      };
-      ["projects", "inspections", "snags", "revisions", "templates", "remarks"].forEach(function (k) { merge(k); });
+      next = Object.assign({}, state);
+      ["projects", "inspections", "snags", "revisions", "templates", "remarks"].forEach(function (k) {
+        const have = new Set(state[k].map(function (x) { return x.id; }));
+        next[k] = state[k].concat(incoming[k].filter(function (x) { return !have.has(x.id); }));
+      });
       const localC = (state.counters && typeof state.counters === "object" && !Array.isArray(state.counters)) ? state.counters : {};
       const inC = (incoming.counters && typeof incoming.counters === "object" && !Array.isArray(incoming.counters)) ? incoming.counters : {};
       const merged = {};
       Object.keys(localC).concat(Object.keys(inC)).forEach(function (y) {
         merged[y] = Math.max(Number(localC[y]) || 0, Number(inC[y]) || 0);
       });
-      state.counters = merged;
+      next.counters = merged;
     }
-    for (const p of (json.photos || [])) {
-      const existing = await idbGet("photos", p.id);
-      if (existing && mode !== "replace") continue;
-      await idbPut("photos", {
+    const prev = state;
+    state = next;
+    try {
+      await flush();
+    } catch (err) {
+      state = prev;
+      throw err;
+    }
+  }
+
+  async function restore(json, mode) {
+    if (!json || json.format !== "lumax-punchlist-backup") {
+      throw new Error("That file is not a Lumax Punch List backup.");
+    }
+    const incoming = migrate(json.state || {});
+    // Decode every photo before anything here changes, so a damaged file
+    // fails cleanly instead of half way through.
+    const photos = (json.photos || []).filter(function (p) { return p && p.id; }).map(function (p) {
+      return {
         id: p.id, blob: b64ToBlob(p.data, "image/jpeg"), thumb: p.thumb, w: p.w, h: p.h,
         kind: p.kind, caption: p.caption, created_at: p.created_at,
-      });
+      };
+    });
+    // Add the backup's new photos before deleting or changing any. If anything
+    // fails before the restored state is saved, the ones added are removed
+    // again, so the device is left exactly as it was.
+    const added = [];
+    const overwrite = [];   // replace: ids already here, updated only once committed
+    try {
+      for (const p of photos) {
+        if (await idbHas("photos", p.id)) {
+          if (mode === "replace") overwrite.push(p);
+          continue;
+        }
+        await idbPut("photos", p);
+        added.push(p.id);
+      }
+      await commitRestore(incoming, mode);
+    } catch (err) {
+      for (const id of added) { try { await idbDel("photos", id); } catch (e) { } }
+      throw err;
     }
-    await flush();
-    return state;
+    for (const p of overwrite) { try { await idbPut("photos", p); } catch (e) { } }
+
+    // Only now drop photos the restored data no longer uses. A data-only
+    // backup carries no photos, so the ones it still points at stay.
+    const keep = referenced(state);
+    photos.forEach(function (p) { keep.add(p.id); });
+    let present = await idbKeys("photos");
+    if (mode === "replace") {
+      urlCache.forEach(function (u) { URL.revokeObjectURL(u); });
+      urlCache.clear();
+      for (const id of present) {
+        if (!keep.has(id)) { try { await idbDel("photos", id); } catch (e) { } }
+      }
+      present = await idbKeys("photos");
+    }
+    const have = new Set(present);
+    let missing = 0;
+    referenced(state).forEach(function (id) { if (!have.has(id)) missing++; });
+    return { missingPhotos: missing };
   }
 
   async function usage() {
@@ -1095,21 +1217,28 @@ const Store = (function () {
     return { quota: quota, used: used, photoCount: photos.length, photoBytes: bytes };
   }
 
+  /** Ids of every photo a snag or inspection in `s` points at. */
+  function referenced(s) {
+    const ids = new Set();
+    s.snags.forEach(function (sn) { (sn.photos || []).forEach(function (id) { ids.add(id); }); });
+    s.inspections.forEach(function (i) {
+      (i.photos || []).forEach(function (id) { ids.add(id); });
+      if (i.site_photo_id) ids.add(i.site_photo_id);
+      if (i.site_plan_id) ids.add(i.site_plan_id);
+    });
+    return ids;
+  }
+
   /** Photos no longer referenced by any snag or inspection. */
   async function orphans() {
-    const referenced = new Set();
-    state.snags.forEach(function (s) { (s.photos || []).forEach(function (id) { referenced.add(id); }); });
-    state.inspections.forEach(function (i) {
-      (i.photos || []).forEach(function (id) { referenced.add(id); });
-      if (i.site_photo_id) referenced.add(i.site_photo_id);
-      if (i.site_plan_id) referenced.add(i.site_plan_id);
-    });
+    const used = referenced(state);
     const all = await idbAll("photos");
-    return all.filter(function (p) { return !referenced.has(p.id); });
+    return all.filter(function (p) { return !used.has(p.id); });
   }
 
   return {
     load: load, get: get, save: save, flush: flush, blank: blank,
+    release: release, onStale: onStale,
     addPhoto: addPhoto, getPhoto: getPhoto, delPhoto: delPhoto,
     photoUrl: photoUrl, photoThumb: photoThumb, photoBytes: photoBytes,
     backup: backup, restore: restore, usage: usage, orphans: orphans,
@@ -2992,14 +3121,19 @@ const UI = (function () {
       const files = await pickFile("application/json,.json", false);
       if (!files.length) return;
       if (!confirm("Restore this backup into this device?\n\nCancel stops. Nothing will change.")) return;
-      const mode = confirm("OK = replace everything here with the backup\nCancel = merge, keeping what is already here") ? "replace" : "merge";
+      const mode = confirm("OK = replace everything here with the backup (photos it still uses are kept)\nCancel = merge, keeping what is already here") ? "replace" : "merge";
       try {
         const text = await files[0].text();
-        await Store.restore(JSON.parse(text), mode);
+        const res = await Store.restore(JSON.parse(text), mode);
         UI.clearUsage();
         App.route = "home"; App.inspId = null;
         UI.render();
-        UI.toast("Backup restored");
+        if (res.missingPhotos) {
+          UI.toast("Backup restored · " + res.missingPhotos + " photo" + (res.missingPhotos > 1 ? "s are" : " is") +
+            " not on this device. Restore a full backup to bring them back.", true, 9000);
+        } else {
+          UI.toast("Backup restored");
+        }
       } catch (err) {
         UI.toast("Restore failed: " + (err.message || err), true, 8000);
       }
@@ -3030,7 +3164,9 @@ const UI = (function () {
     clearTimeout(typeTimer);
     const active = document.activeElement;
     const f = active && active.closest ? active.closest("[data-f]") : null;
-    if (f) applyField(f.getAttribute("data-f"), f.value);
+    // Only real entry fields. A date button carries data-f too, but its
+    // value is empty (the date lives in data-v), so applying it would clear the date.
+    if (f && f.tagName !== "BUTTON") applyField(f.getAttribute("data-f"), f.value);
   }
 
   function applyField(name, value) {
@@ -3128,7 +3264,75 @@ const UI = (function () {
     if (ev.key === "Escape" && App.modal) { flushPendingField(); UI.closeModal(); UI.render(); }
   });
 
-  window.addEventListener("beforeunload", function () { Store.flush(); });
+  // Save typed text too, not just the debounced state. Phones often kill a
+  // backgrounded tab without beforeunload, so also save when it is hidden.
+  function saveNow() {
+    flushPendingField();
+    Store.flush().catch(function () { });
+  }
+  window.addEventListener("beforeunload", saveNow);
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "hidden") saveNow();
+  });
+
+  /* ------------------------------------------------------- one tab only -- */
+  /* Each tab holds its own copy of the data, so two tabs editing at once
+     would overwrite each other. A newly opened tab asks the open one to save
+     and step aside; Store refuses any write from a tab that is out of date. */
+  const TAB_LOCK = "lumax-punchlist-active";
+  const channel = ("BroadcastChannel" in window) ? new BroadcastChannel("lumax-punchlist") : null;
+  let releaseTab = null;
+
+  const STALE_TEXT = {
+    conflict: ["This data was changed in another tab",
+      "Your last change here was not saved, so the other tab's work is not overwritten."],
+    claimed: ["This app is open in another tab",
+      "Everything here has been saved. Only one tab can make changes at a time."],
+    draft: ["This app is open in another tab",
+      "Only one tab can make changes at a time. Everything here has been saved except the form that was open, which was never saved."],
+    failed: ["This app is open in another tab",
+      "Your last changes here could not be saved. Only one tab can make changes at a time."],
+  };
+
+  function showStale(why) {
+    if (document.getElementById("stale")) return;
+    const t = STALE_TEXT[why];
+    const d = document.createElement("div");
+    d.id = "stale";
+    d.className = "stale";
+    d.innerHTML = '<div class="banner warn"><span>!</span><span><b>' + t[0] + "</b>" + t[1] +
+      '<br><br><button class="btn btn-p" type="button">Use this tab instead</button></span></div>';
+    d.querySelector("button").addEventListener("click", function () { location.reload(); });
+    document.body.appendChild(d);
+  }
+  Store.onStale(function () { showStale("conflict"); });
+
+  async function claimTab() {
+    if (!channel) return;
+    channel.onmessage = async function (ev) {
+      if (!ev.data || ev.data.type !== "claim") return;
+      flushPendingField();
+      const draftOpen = !!(App.modal && App.modal.draft);
+      const ok = await Store.release();
+      showStale(!ok ? "failed" : draftOpen ? "draft" : "claimed");
+      if (releaseTab) { releaseTab(); releaseTab = null; }
+    };
+    channel.postMessage({ type: "claim" });
+    if (!navigator.locks || !window.AbortController) return;
+    // Wait for the open tab to finish saving, but not for ever: a tab asleep
+    // on a phone may never answer, and Store's write check still covers that.
+    const ctl = new AbortController();
+    const timer = setTimeout(function () { ctl.abort(); }, 3000);
+    try {
+      await new Promise(function (res, rej) {
+        navigator.locks.request(TAB_LOCK, { signal: ctl.signal }, function () {
+          res();
+          return new Promise(function (r) { releaseTab = r; });
+        }).catch(rej);
+      });
+    } catch (e) { }
+    clearTimeout(timer);
+  }
 
   /* --------------------------------------------------------------- boot -- */
   async function boot() {
@@ -3150,6 +3354,7 @@ const UI = (function () {
     });
 
     try {
+      await claimTab();
       await Store.load();
     } catch (err) {
       document.getElementById("view").innerHTML =
