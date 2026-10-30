@@ -3520,13 +3520,25 @@ const UI = (function () {
     // sheet it was typed in (setting it here first would send it to the snag).
     snagSheet(s.id);
   }
-  function gpsSheet(s, status, trying) {
+  // iPhones and iPads (iPadOS asks for the desktop site, so it says Mac but
+  // has touch) keep the location switch for web pages under Safari, not Chrome.
+  function isIOS() {
+    return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+      (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  }
+  /** keep: redraw the GPS sheet that is already open for this snag without
+   *  losing the coordinates typed into it. */
+  function gpsSheet(s, status, trying, keep) {
+    // Save what was just typed while App.modal still names the sheet it was typed in.
+    flushPendingField();
+    const old = keep && App.modal && App.modal.type === "gps" && App.modal.snagId === s.id ? App.modal.draft : null;
     App.snagId = s.id;
-    App.modal = { type: "gps", id: s.id, snagId: s.id, draft: { lat: s.lat != null ? String(s.lat) : "", lng: s.lng != null ? String(s.lng) : "", pair: "" } };
+    App.modal = { type: "gps", id: s.id, snagId: s.id, draft: old || { lat: s.lat != null ? String(s.lat) : "", lng: s.lng != null ? String(s.lng) : "", pair: "" } };
     const banner = status
       ? '<div class="banner ' + (trying ? "info" : "warn") + '" style="margin-bottom:12px"><span>' +
         (trying ? "◎" : "!") + "</span><span>" + esc(status) + "</span></div>"
       : "";
+    const ios = isIOS();
     UI.openModal(
       UI.sheetHead("GPS") +
       '<div class="sheet-b">' + banner +
@@ -3535,34 +3547,69 @@ const UI = (function () {
       "</div>" +
       UI.field("Latitude", UI.input("gps.lat", App.modal.draft.lat, { placeholder: "-25.7479", inputmode: "decimal" })) +
       UI.field("Longitude", UI.input("gps.lng", App.modal.draft.lng, { placeholder: "28.2293", inputmode: "decimal" })) +
-      UI.field("Or paste both", UI.input("gps.pair", "", { placeholder: "-25.7479, 28.2293" })) +
+      UI.field("Or paste both", UI.input("gps.pair", App.modal.draft.pair, { placeholder: "-25.7479, 28.2293" })) +
       '<div class="btn-row">' +
       '<button class="btn btn-p" data-a="gps-save">Save coordinates</button>' +
       '<button class="btn" data-a="back-to-snag">Back to snag</button></div>' +
-      '<p class="muted" style="margin-top:12px">' + (location.protocol === "file:"
+      '<p class="muted" style="margin-top:12px">' + (ios
+        ? "If the phone will not give a position, turn on Settings → Privacy & Security → Location Services → Safari Websites (While Using), and in Safari tap aA → Website Settings → Location → Allow. "
+        : location.protocol === "file:"
         ? "Allowing Location for Chrome is not enough if you opened this file from Downloads. Chrome still blocks live GPS on file://. "
         : "If the phone will not give a position, allow Location for this site (lock icon near the address). ") +
       "Paste from Google Maps (share → copy coordinates) or place a pin on the plan.</p>" +
-      "</div>"
+      "</div>",
+      "gps:" + s.id
     );
   }
   function requestGps(s) {
     if (!s) return;
-    gpsSheet(s, "Asking the phone for a position… Allow location if it asks.", true);
+    // A fix can take up to 20 s. Each request gets its own token, so only the
+    // newest one may act, and only on its own snag's GPS or snag sheet.
+    const req = {};
+    App.gpsReq = req;
+    gpsSheet(s, "Asking the phone for a position… Allow location if it asks.", true, true);
+    // Typing from here on means the coordinates were entered by hand.
+    App.modal.draft.typed = false;
     if (!navigator.geolocation) {
-      gpsSheet(s, "This browser has no location support. Paste coordinates from Maps.", false);
+      gpsSheet(s, "This browser has no location support. Paste coordinates from Maps.", false, true);
       return;
     }
+    // Which sheet is open for this snag now: "gps", "snag" or null (moved on).
+    function openFor(id) {
+      const m = App.modal;
+      if (m && m.type === "gps" && m.snagId === id) return "gps";
+      if (m && m.type === "snag" && m.id === id) return "snag";
+      return null;
+    }
     navigator.geolocation.getCurrentPosition(function (pos) {
-      saveCoords(s, pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy);
-      UI.toast("Position captured ±" + Math.round(pos.coords.accuracy) + " m");
+      if (App.gpsReq !== req) return;
+      App.gpsReq = null;
+      flushPendingField();
+      // A restore can swap state while we wait, so look the snag up again.
+      const cur = snagById(s.id);
+      const where = cur ? openFor(cur.id) : null;
+      if (where === "snag" || (where === "gps" && !App.modal.draft.typed)) {
+        saveCoords(cur, pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy);
+        UI.toast("Position captured ±" + Math.round(pos.coords.accuracy) + " m");
+      } else if (where === "gps") {
+        // Never overwrite coordinates typed while waiting.
+        gpsSheet(cur, "The phone's position arrived after you typed coordinates, so yours were kept. Tap Save coordinates, or Use phone GPS to replace them.", false, true);
+      } else if (cur) {
+        // The user is on another screen: do not take it over or save behind their back.
+        UI.toast("GPS for snag " + cur.snag_number + " arrived after you left it and was not saved. Tap Capture GPS to try again.", false, 5000);
+      }
     }, function (err) {
+      if (App.gpsReq !== req) return;
+      App.gpsReq = null;
+      const ios = isIOS();
       var msg = "Could not get a position.";
       if (err && err.code === 1) {
-        if (!window.isSecureContext || location.protocol === "file:") {
+        if (ios) {
+          msg = "Location is blocked for Safari. Settings → Privacy & Security → Location Services → Safari Websites → While Using, then in Safari tap aA → Website Settings → Location → Allow. Or paste from Maps, or pin on the plan.";
+        } else if (!window.isSecureContext || location.protocol === "file:") {
           msg = "Chrome blocked GPS on this downloaded file. Location can be on for Chrome and still fail here. Paste from Maps, or pin on the plan.";
         } else {
-          msg = "This page was blocked from using location. Tap the lock icon near the address and allow Location, or Settings → Chrome → Location.";
+          msg = "This page was blocked from using location. Tap the lock icon near the address and allow Location, or Settings → Apps → Chrome → Permissions → Location.";
         }
       } else if (err && err.code === 2) {
         msg = "Position unavailable. Try again outdoors, or paste from Maps.";
@@ -3571,7 +3618,11 @@ const UI = (function () {
       } else if (err && err.message) {
         msg = err.message;
       }
-      gpsSheet(s, msg, false);
+      const cur = snagById(s.id);
+      const where = cur ? openFor(cur.id) : null;
+      // Only the banner changes; typed coordinates stay. Elsewhere nothing is redrawn.
+      if (where === "gps") gpsSheet(cur, msg, false, true);
+      else if (where === "snag") UI.toast(msg, true, 6000);
     }, { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 });
   }
 
@@ -3843,6 +3894,10 @@ const UI = (function () {
     "gps-save": function () {
       const s = snagById(App.modal.snagId || App.modal.id) || snagById(App.snagId);
       if (!s) return;
+      // Save the last keystrokes first; a tap on Save may not blur the box.
+      flushPendingField();
+      // Editing a box clears the pasted pair (applyField), so a pair that is
+      // still here was the last thing entered.
       const d = App.modal.draft || {};
       let c = parseCoords(d.pair || "");
       if (!c && d.lat && d.lng) c = parseCoords(d.lat + ", " + d.lng);
@@ -4187,10 +4242,23 @@ const UI = (function () {
     } else if (name.indexOf("gps.") === 0 && App.modal && App.modal.type === "gps") {
       App.modal.draft = App.modal.draft || {};
       const key = name.slice(4);
+      if (App.modal.draft[key] === value) return;
       App.modal.draft[key] = value;
+      // Typed by hand, so a GPS fix still on its way must not overwrite it.
+      App.modal.draft.typed = true;
+      const box = function (k) { return document.querySelector('#modal [data-f="gps.' + k + '"]'); };
       if (key === "pair") {
         const c = parseCoords(value);
-        if (c) { App.modal.draft.lat = String(c.lat); App.modal.draft.lng = String(c.lng); }
+        if (c) {
+          App.modal.draft.lat = String(c.lat); App.modal.draft.lng = String(c.lng);
+          // Show the pasted pair in the boxes, so what Save will use is on screen.
+          if (box("lat")) box("lat").value = App.modal.draft.lat;
+          if (box("lng")) box("lng").value = App.modal.draft.lng;
+        }
+      } else {
+        // The boxes were edited after a paste, so they win over the pasted pair.
+        App.modal.draft.pair = "";
+        if (box("pair")) box("pair").value = "";
       }
       return;
     } else if (App.modal && App.modal.type === "snag") {
