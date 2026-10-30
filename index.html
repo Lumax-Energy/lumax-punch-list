@@ -1543,49 +1543,80 @@ const Store = (function () {
   }
 
   /** Two phones adding snags to the same shared inspection both issue the
-   *  same next number, so a merge can bring in a second snag 6. Give each
-   *  clashing new snag the next free number in its inspection. Snags already
-   *  on this device keep theirs: they may be on issued reports. Also raise
+   *  same next number, so a merge can bring in a second snag 6. Where a
+   *  number is held by more than one snag and one of them is new from the
+   *  backup, the snag made first (then the smaller id) keeps it and the rest
+   *  move to the next free numbers, in that same order. The rule does not
+   *  depend on which phone runs the merge, so two phones that swap backups
+   *  give every snag the same code. That can mean renumbering a snag that
+   *  was already here (to the number the backup gave it, if the other phone
+   *  already moved it); its old code is kept in previous_codes. Also raise
    *  each inspection's last_snag_number past every snag it now has, so the
-   *  next snag made here cannot clash either. Inspections already here are
-   *  copied before changing, so a failed save leaves the state untouched.
-   *  Returns [{ from, to }] codes. */
+   *  next snag made here cannot clash either. Snags and inspections already
+   *  here are copied before changing, so a failed save leaves the state
+   *  untouched. Returns [{ from, to }] codes. */
   function renumberSnagClashes(next, added, incoming) {
     const isAdded = new Set(added.map(function (sn) { return sn.id; }));
     const backupLast = new Map(incoming.inspections.map(function (i) { return [i.id, Number(i.last_snag_number) || 0]; }));
-    // Numbers already used in each inspection by snags that were here before.
-    const used = new Map();
-    next.snags.forEach(function (sn) {
-      if (isAdded.has(sn.id) || sn.snag_number == null) return;
-      if (!used.has(sn.inspection_id)) used.set(sn.inspection_id, new Set());
-      used.get(sn.inspection_id).add(sn.snag_number);
+    // Only inspections that got new snags can have a new clash.
+    const hit = new Set(added.map(function (sn) { return sn.inspection_id; }));
+    // The backup's own copy of each snag, per inspection: id -> snag id -> snag.
+    const incomingById = new Map();
+    incoming.snags.forEach(function (sn) {
+      if (!incomingById.has(sn.inspection_id)) incomingById.set(sn.inspection_id, new Map());
+      incomingById.get(sn.inspection_id).set(sn.id, sn);
     });
-    const byInsp = new Map();
-    added.forEach(function (sn) {
-      if (!byInsp.has(sn.inspection_id)) byInsp.set(sn.inspection_id, []);
-      byInsp.get(sn.inspection_id).push(sn);
+    // Where each number sits in next.snags, per inspection: id -> number -> [index].
+    const holders = new Map();
+    next.snags.forEach(function (sn, idx) {
+      if (!hit.has(sn.inspection_id) || sn.snag_number == null) return;
+      if (!holders.has(sn.inspection_id)) holders.set(sn.inspection_id, new Map());
+      const byNum = holders.get(sn.inspection_id);
+      if (!byNum.has(sn.snag_number)) byNum.set(sn.snag_number, []);
+      byNum.get(sn.snag_number).push(idx);
     });
+    // Made first, then smaller id: the same order on every phone.
+    const older = function (a, b) {
+      const x = next.snags[a], y = next.snags[b];
+      const cx = String(x.created_at || ""), cy = String(y.created_at || "");
+      if (cx !== cy) return cx < cy ? -1 : 1;
+      return String(x.id) < String(y.id) ? -1 : String(x.id) > String(y.id) ? 1 : 0;
+    };
     const out = [];
     next.inspections = next.inspections.map(function (insp) {
-      const fresh = byInsp.get(insp.id);
-      if (!fresh) return insp;
-      const taken = used.get(insp.id) || new Set();
+      if (!hit.has(insp.id)) return insp;
+      const byNum = holders.get(insp.id) || new Map();
       // Start above every number either copy has used, including deleted snags.
       let top = Math.max(Number(insp.last_snag_number) || 0, backupLast.get(insp.id) || 0);
-      taken.forEach(function (n) { top = Math.max(top, n); });
-      fresh.forEach(function (sn) { if (sn.snag_number != null) top = Math.max(top, sn.snag_number); });
-      fresh.forEach(function (sn) {
-        if (sn.snag_number == null) return;
-        if (taken.has(sn.snag_number)) {
-          top++;
-          const from = sn.code;
-          sn.snag_number = top;
-          sn.code = insp.number + "-" + String(top).padStart(3, "0");
-          // Kept, so a report or message that used the old code still finds it.
-          if (from) sn.previous_codes = (sn.previous_codes || []).concat(from);
-          out.push({ from: from || "", to: sn.code });
-        }
-        taken.add(sn.snag_number);
+      (incomingById.get(insp.id) || new Map()).forEach(function (sn) {
+        if (sn.snag_number != null) top = Math.max(top, sn.snag_number);
+      });
+      const movers = [];
+      byNum.forEach(function (idxs, n) {
+        top = Math.max(top, n);
+        if (idxs.length < 2 || !idxs.some(function (i) { return isAdded.has(next.snags[i].id); })) return;
+        idxs.sort(older);
+        movers.push.apply(movers, idxs.slice(1));
+      });
+      const adopted = new Set();
+      movers.sort(older).forEach(function (idx) {
+        const old = next.snags[idx];
+        const from = old.code;
+        // The other phone already moved this snag of ours when it merged our
+        // backup: take the number it gave, so both phones end up the same.
+        const there = isAdded.has(old.id) ? null : (incomingById.get(insp.id) || new Map()).get(old.id);
+        const theirs = there && there.snag_number != null && there.snag_number !== old.snag_number &&
+          (there.previous_codes || []).indexOf(from) >= 0 && !byNum.has(there.snag_number) &&
+          !adopted.has(there.snag_number) ? there.snag_number : null;
+        let n;
+        if (theirs != null) { n = theirs; adopted.add(n); } else n = ++top;
+        const sn = isAdded.has(old.id) ? old : Object.assign({}, old);
+        sn.snag_number = n;
+        sn.code = insp.number + "-" + String(n).padStart(3, "0");
+        // Kept, so a report or message that used the old code still finds it.
+        if (from) sn.previous_codes = (sn.previous_codes || []).concat(from);
+        next.snags[idx] = sn;
+        out.push({ from: from || "", to: sn.code });
       });
       if ((Number(insp.last_snag_number) || 0) === top) return insp;
       return Object.assign({}, insp, { last_snag_number: top });
@@ -2354,11 +2385,16 @@ const Report = (function () {
       // Control characters are not allowed in XML at all; Excel uses \n alone.
       .replace(/\r\n?/g, "\n")
       .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\ufffe\uffff]/g, "")
+      // An Excel cell holds at most 32,767 characters; more and it will not
+      // open. Cut before escaping, and not between the two halves of an emoji.
+      .replace(/^[\s\S]{32768,}$/, function (t) {
+        const cut = t.slice(0, 32767);
+        return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut;
+      })
       // Excel reads "_x0041_" in a string as an escaped "A": escape the
-      // underscore so such text comes back as typed.
-      .replace(/_(x[0-9A-Fa-f]{4}_)/g, "_x005F_$1")
-      // An Excel cell holds at most 32,767 characters; more and it will not open.
-      .slice(0, 32767)
+      // underscore so such text comes back as typed. The lookahead uses up
+      // nothing, so both tokens in "_x0041_x0042_" are escaped.
+      .replace(/_(?=x[0-9A-Fa-f]{4}_)/g, "_x005F_")
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
 
@@ -2545,6 +2581,13 @@ const Report = (function () {
   /** True only once a check has found the photo is not stored here. */
   function photoMissing(id) { return onDevice.get(id) === false; }
 
+  /** Drop what was found about one photo, or about all of them after a
+   *  restore or clean-up changes the photo store, so a photo that is back
+   *  is never shown as missing (whose × would delete the real photo). */
+  function forgetPhotos(id) {
+    if (id) onDevice.delete(id); else onDevice.clear();
+  }
+
   /** The snag's photos less any known to be missing on this device. */
   function keptPhotos(s) {
     return (s.photos || []).filter(function (id) { return !photoMissing(id); });
@@ -2609,7 +2652,7 @@ const Report = (function () {
 
   return {
     buildDocx: buildDocx, buildCsv: buildCsv, buildXlsx: buildXlsx, preflight: preflight, refreshEvidence: refreshEvidence,
-    refreshPhotos: refreshPhotos, photoMissing: photoMissing, keptPhotos: keptPhotos,
+    refreshPhotos: refreshPhotos, photoMissing: photoMissing, keptPhotos: keptPhotos, forgetPhotos: forgetPhotos,
     renderMap: renderMap, fileBase: fileBase, filterSnags: filterSnags,
   };
 })();
@@ -3559,12 +3602,20 @@ const UI = (function () {
       "</div>", "snag:" + s.id);
 
     // Show each photo's kind label, or say so when the photo is not stored here.
-    (s.photos || []).forEach(function (pid) {
-      Store.getPhoto(pid).then(function (p) {
+    const back = [];
+    Promise.all((s.photos || []).map(function (pid) {
+      return Store.getPhoto(pid).then(function (p) {
+        // Drawn as missing from an old check, but it is here now (a full
+        // restore brought it back): draw it again as a real photo below.
+        if (p && Report.photoMissing(pid)) { Report.forgetPhotos(pid); back.push(pid); }
         const el = document.querySelector('.k[data-id="' + CSS.escape(pid) + '"]');
         if (el && p) el.textContent = p.kind === "closeout" ? "Close-out" : p.kind === "after" ? "After" : "Before";
         else if (el && !p) el.closest(".photocell").innerHTML = missingPhotoCell(pid);
       });
+    })).then(function () {
+      // Only while this snag's sheet is still the one on screen.
+      if (back.length && App.modal && App.modal.type === "snag" && App.modal.id === s.id &&
+        document.querySelector('#modal .sheet[data-key="snag:' + CSS.escape(s.id) + '"]')) snagSheet(s.id);
     });
   }
 
@@ -3780,10 +3831,13 @@ const UI = (function () {
       return;
     }
     // Which sheet is open for this snag now: "gps", "snag" or null (moved on).
+    // The photo viewer and date picker opened from the snag keep App.modal as
+    // the snag, so also check that the snag sheet itself is on screen.
     function openFor(id) {
       const m = App.modal;
       if (m && m.type === "gps" && m.snagId === id) return "gps";
-      if (m && m.type === "snag" && m.id === id) return "snag";
+      if (m && m.type === "snag" && m.id === id &&
+        document.querySelector('#modal .sheet[data-key="snag:' + CSS.escape(id) + '"]')) return "snag";
       return null;
     }
     navigator.geolocation.getCurrentPosition(function (pos) {
@@ -4033,7 +4087,8 @@ const UI = (function () {
       const st = Store.get(), i = insp();
       // Keep the site's zero padding ("Table 07" → "Table 05"), and compare by
       // number so "Table 07" never gets a copy of itself as "Table 7".
-      const width = m ? m[2].length : 0, own = m ? parseInt(m[2], 10) : null;
+      // Pad only a number that really starts with 0: "Table 12" → "Table 4", not "Table 04".
+      const width = m && m[2].length > 1 && m[2][0] === "0" ? m[2].length : 0, own = m ? parseInt(m[2], 10) : null;
       let made = 0;
       nums.forEach(function (n) {
         const name = (prefix + String(n).padStart(width, "0")).trim();
@@ -4116,6 +4171,8 @@ const UI = (function () {
       let c = parseCoords(d.pair || "");
       if (!c && d.lat && d.lng) c = parseCoords(d.lat + ", " + d.lng);
       if (!c) return UI.toast("Enter latitude and longitude, or paste both", true);
+      // Coordinates saved by hand replace any phone fix still on its way.
+      App.gpsReq = null;
       saveCoords(s, c.lat, c.lng, null);
       UI.toast("Coordinates saved");
     },
@@ -4371,6 +4428,8 @@ const UI = (function () {
       try {
         const opened = await Store.openBackup(files[0]);
         const res = await Store.restore(opened.json, mode, opened.files);
+        // Photos came and went: check each one again rather than trust an old answer.
+        Report.forgetPhotos();
         UI.clearUsage();
         App.route = "home"; App.inspId = null;
         UI.render();
@@ -4408,6 +4467,7 @@ const UI = (function () {
       if (!orphans.length) return UI.toast("No unused photos");
       if (!confirm("Remove " + orphans.length + " photos that no snag uses?")) return;
       for (const p of orphans) await Store.delPhoto(p.id);
+      Report.forgetPhotos();
       UI.clearUsage(); UI.render();
       UI.toast(orphans.length + " photos removed");
     },
@@ -4419,6 +4479,7 @@ const UI = (function () {
       const fresh = Store.blank();
       Object.keys(fresh).forEach(function (k) { Store.get()[k] = fresh[k]; });
       await Store.flush();
+      Report.forgetPhotos();
       UI.clearUsage(); App.route = "home"; App.inspId = null; UI.render();
       UI.toast("Device erased");
     },
@@ -4514,6 +4575,12 @@ const UI = (function () {
   }
 
   document.addEventListener("click", function (ev) {
+    // A tap on a field's caption is passed on to its first control. Good for
+    // a text box, but when that control is a button (a risk or kind choice,
+    // a date) it would quietly pick that option or open the date picker.
+    const lab = ev.target.closest("label");
+    if (lab && lab.control && lab.control.tagName === "BUTTON" &&
+      !ev.target.closest("button, input, select, textarea")) ev.preventDefault();
     const el = ev.target.closest("[data-a]");
     if (!el) return;
     const a = el.getAttribute("data-a");
