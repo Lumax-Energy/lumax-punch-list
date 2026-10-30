@@ -907,28 +907,87 @@ const Store = (function () {
     return state;
   }
 
+  /* A backup file can come from anywhere (WhatsApp, email), so migrate()
+     also forces every field back to the type the app itself writes. The
+     screens still escape everything; this keeps odd values from breaking
+     sorting, sums and class names. */
+  function isObj(x) { return x != null && typeof x === "object" && !Array.isArray(x); }
+  function asText(o, keys) {
+    keys.forEach(function (k) { if (o[k] != null && typeof o[k] !== "string") o[k] = String(o[k]); });
+  }
+  function asNum(v) {
+    if (v == null || v === "") return null;
+    const n = Number(v);
+    return isFinite(n) ? n : null;
+  }
+  function asIds(a) {
+    return Array.isArray(a) ? a.filter(function (x) { return x != null && x !== ""; }).map(String) : [];
+  }
+  function asRisk(r) { return r === "LR" ? "LR" : "HR"; }
+
   /** Forward-only migration. Old records must keep working. */
   function migrate(s) {
+    if (!isObj(s)) s = {};
     const base = blank();
-    const out = Object.assign(base, s);
-    out.settings = Object.assign({}, DEFAULT_SETTINGS, s.settings || {});
+    const out = Object.assign(blank(), s);
+    out.settings = Object.assign({}, DEFAULT_SETTINGS, isObj(s.settings) ? s.settings : {});
+    asText(out.settings, ["company_name", "report_title", "company_footer", "inspection_prefix",
+      "inspector_name", "risk_legend", "legend"]);
+    out.settings.photo_max_edge = asNum(out.settings.photo_max_edge) || DEFAULT_SETTINGS.photo_max_edge;
+    out.settings.photo_quality = asNum(out.settings.photo_quality) || DEFAULT_SETTINGS.photo_quality;
     ["projects", "inspections", "snags", "templates", "remarks", "revisions"].forEach(function (k) {
-      if (!Array.isArray(out[k])) out[k] = base[k];
+      out[k] = Array.isArray(out[k]) ? out[k].filter(isObj) : base[k];
     });
-    if (!Array.isArray(out.categories) || !out.categories.length) out.categories = CATEGORIES.slice();
+    out.categories = Array.isArray(out.categories)
+      ? out.categories.filter(function (c) { return c != null && c !== ""; }).map(String) : [];
+    if (!out.categories.length) out.categories = CATEGORIES.slice();
+    out.projects.forEach(function (p) {
+      asText(p, ["id", "code", "name", "client_name", "location", "status"]);
+    });
     out.snags.forEach(function (sn) {
-      if (!Array.isArray(sn.photos)) sn.photos = [];
-      if (!Array.isArray(sn.references)) sn.references = [];
-      if (!Array.isArray(sn.history)) sn.history = [];
-      if (!sn.status) sn.status = "open";
-      if (!sn.risk) sn.risk = "HR";
+      asText(sn, ["id", "inspection_id", "code", "block_table", "support_no", "location_text", "category",
+        "description", "required_action", "contractor_response", "due_date", "priority"]);
+      sn.photos = asIds(sn.photos);
+      sn.references = Array.isArray(sn.references) ? sn.references.filter(isObj) : [];
+      sn.references.forEach(function (r) { asText(r, ["ref_type", "document", "detail"]); });
+      sn.history = Array.isArray(sn.history) ? sn.history.filter(isObj) : [];
+      sn.history.forEach(function (h) { asText(h, ["from", "to", "at", "by", "comment"]); });
+      sn.status = STATUS_LABEL.hasOwnProperty(sn.status) ? sn.status : "open";
+      sn.risk = asRisk(sn.risk);
+      ["snag_number", "lat", "lng", "gps_accuracy", "pin_x", "pin_y"].forEach(function (k) {
+        sn[k] = asNum(sn[k]);
+      });
+      // A pin needs both coordinates, and a GPS fix needs both halves.
+      if (sn.pin_x == null || sn.pin_y == null) { sn.pin_x = null; sn.pin_y = null; }
+      if (sn.lat == null || sn.lng == null) { sn.lat = null; sn.lng = null; }
     });
     out.inspections.forEach(function (i) {
-      if (!Array.isArray(i.photos)) i.photos = [];
+      asText(i, ["id", "number", "project_id", "area", "type", "inspection_date", "next_inspection_date",
+        "inspector_name", "client_qc_name", "status", "general_remarks", "technical_notes",
+        "site_photo_id", "site_plan_id"]);
+      i.photos = asIds(i.photos);
       if (i.general_remarks == null) i.general_remarks = "";
       if (i.technical_notes == null) i.technical_notes = "";
+      i.rev = asNum(i.rev) || 0;
+      if (i.last_snag_number != null) i.last_snag_number = asNum(i.last_snag_number);
     });
-    if (!out.counters || typeof out.counters !== "object" || Array.isArray(out.counters)) out.counters = {};
+    out.revisions.forEach(function (r) {
+      asText(r, ["id", "inspection_id", "reason", "by", "created_at"]);
+      r.rev = asNum(r.rev) || 0;
+      r.snag_count = asNum(r.snag_count) || 0;
+    });
+    out.templates.forEach(function (t) {
+      asText(t, ["id", "label", "category", "description", "required_action", "ref_type", "ref_document", "ref_detail"]);
+      t.risk = asRisk(t.risk);
+    });
+    out.remarks.forEach(function (r) {
+      asText(r, ["id", "title", "kind", "body", "source"]);
+    });
+    if (!isObj(out.counters)) out.counters = {};
+    Object.keys(out.counters).forEach(function (y) {
+      const n = asNum(out.counters[y]);
+      if (n == null) delete out.counters[y]; else out.counters[y] = n;
+    });
     return out;
   }
 
@@ -1164,10 +1223,17 @@ const Store = (function () {
     const incoming = migrate(json.state || {});
     // Decode every photo before anything here changes, so a damaged file
     // fails cleanly instead of half way through.
-    const photos = (json.photos || []).filter(function (p) { return p && p.id; }).map(function (p) {
+    // Photo ids end up in attributes and the thumb in an img src, so they
+    // get the same type checks as the state.
+    const photos = (Array.isArray(json.photos) ? json.photos : []).filter(function (p) {
+      return isObj(p) && p.id != null && p.id !== "";
+    }).map(function (p) {
       return {
-        id: p.id, blob: b64ToBlob(p.data, "image/jpeg"), thumb: p.thumb, w: p.w, h: p.h,
-        kind: p.kind, caption: p.caption, created_at: p.created_at,
+        id: String(p.id), blob: b64ToBlob(p.data, "image/jpeg"),
+        thumb: typeof p.thumb === "string" && p.thumb.indexOf("data:image/") === 0 ? p.thumb : null,
+        w: asNum(p.w), h: asNum(p.h),
+        kind: p.kind === "after" || p.kind === "closeout" ? p.kind : "before",
+        caption: p.caption == null ? "" : String(p.caption), created_at: p.created_at == null ? "" : String(p.created_at),
       };
     });
     // Add the backup's new photos before deleting or changing any. If anything
@@ -1861,14 +1927,21 @@ const UI = (function () {
     toastTimer = setTimeout(function () { el.className = "toast" + (bad ? " bad" : ""); }, ms || 2600);
   }
 
-  const tag = function (cls, txt) { return '<span class="tag ' + cls + '">' + esc(txt) + "</span>"; };
+  const tag = function (cls, txt) { return '<span class="tag ' + esc(cls) + '">' + esc(txt) + "</span>"; };
   const riskTag = function (r) { return tag("t-" + r, r); };
   const statusTag = function (s) { return tag("t-" + s, STATUS_LABEL[s] || s); };
 
+  /** A 0–1 fraction as a CSS percentage. A restored file can hold anything,
+   *  so only a finite number ever reaches a style attribute. */
+  function pct(f) {
+    const n = Number(f);
+    return isFinite(n) ? (Math.min(1, Math.max(0, n)) * 100).toFixed(2) : "0";
+  }
+
   function bar(t) {
     if (!t.total) return "";
-    const pc = function (n) { return (n / t.total * 100).toFixed(2) + "%"; };
-    return '<div class="bar" title="' + t.open + " open, " + t.prog + " in progress, " + t.done + ' done">' +
+    const pc = function (n) { return pct(n / t.total) + "%"; };
+    return '<div class="bar" title="' + esc(t.open + " open, " + t.prog + " in progress, " + t.done + " done") + '">' +
       '<i class="open" style="width:' + pc(t.open) + '"></i>' +
       '<i class="prog" style="width:' + pc(t.prog) + '"></i>' +
       '<i class="done" style="width:' + pc(t.done) + '"></i></div>';
@@ -1879,27 +1952,27 @@ const UI = (function () {
   }
   function input(name, value, opts) {
     opts = opts || {};
-    return '<input class="inp" data-f="' + name + '" type="' + (opts.type || "text") + '" value="' +
+    return '<input class="inp" data-f="' + esc(name) + '" type="' + esc(opts.type || "text") + '" value="' +
       esc(value == null ? "" : value) + '"' + (opts.placeholder ? ' placeholder="' + esc(opts.placeholder) + '"' : "") +
-      (opts.inputmode ? ' inputmode="' + opts.inputmode + '"' : "") + " />";
+      (opts.inputmode ? ' inputmode="' + esc(opts.inputmode) + '"' : "") + " />";
   }
   function dateField(name, value) {
     const shown = value ? value : "Pick a date";
-    return '<button type="button" class="datebtn" data-a="open-date" data-f="' + name + '" data-v="' +
+    return '<button type="button" class="datebtn" data-a="open-date" data-f="' + esc(name) + '" data-v="' +
       esc(value || "") + '">' + esc(shown) + "</button>";
   }
   function textarea(name, value, ph, rows) {
-    return '<textarea class="inp" data-f="' + name + '"' + (rows ? ' style="min-height:' + rows * 22 + 'px"' : "") +
+    return '<textarea class="inp" data-f="' + esc(name) + '"' + (rows ? ' style="min-height:' + (Number(rows) || 0) * 22 + 'px"' : "") +
       (ph ? ' placeholder="' + esc(ph) + '"' : "") + ">" + esc(value || "") + "</textarea>";
   }
   function select(name, value, options) {
-    return '<select class="inp" data-f="' + name + '">' + options.map(function (o) {
+    return '<select class="inp" data-f="' + esc(name) + '">' + options.map(function (o) {
       const v = Array.isArray(o) ? o[0] : o, l = Array.isArray(o) ? o[1] : o;
       return '<option value="' + esc(v) + '"' + (String(value) === String(v) ? " selected" : "") + ">" + esc(l) + "</option>";
     }).join("") + "</select>";
   }
   function seg(name, value, options, cls) {
-    return '<div class="seg ' + (cls || "") + '" data-seg="' + name + '">' + options.map(function (o) {
+    return '<div class="seg ' + esc(cls || "") + '" data-seg="' + esc(name) + '">' + options.map(function (o) {
       const v = Array.isArray(o) ? o[0] : o, l = Array.isArray(o) ? o[1] : o;
       return '<button type="button" data-v="' + esc(v) + '" class="' + (String(value) === String(v) ? "on" : "") + '">' + esc(l) + "</button>";
     }).join("") + "</div>";
@@ -1930,8 +2003,8 @@ const UI = (function () {
       const items = [["snags", "Snags", t.total], ["plan", "Plan", ""], ["info", "Info", ""], ["report", "Report", ""]];
       tabs.className = "tabs";
       tabs.innerHTML = items.map(function (i) {
-        return '<button data-a="tab" data-v="' + i[0] + '" class="' + (App.tab === i[0] ? "on" : "") + '">' +
-          (i[2] !== "" ? '<span class="n">' + i[2] + "</span>" : "") + i[1] + "</button>";
+        return '<button data-a="tab" data-v="' + esc(i[0]) + '" class="' + (App.tab === i[0] ? "on" : "") + '">' +
+          (i[2] !== "" ? '<span class="n">' + esc(i[2]) + "</span>" : "") + esc(i[1]) + "</button>";
       }).join("");
       fab.innerHTML = App.tab === "snags"
         ? '<button class="fab" data-a="new-snag">＋ Add snag</button>' : "";
@@ -1956,7 +2029,7 @@ const UI = (function () {
           " " + s.required_action).toLowerCase().indexOf(q) >= 0;
       }).slice(0, 40);
       hits = '<div class="card"><div class="card-h"><h2>Search results</h2><span class="count">' +
-        found.length + "</span></div><div class=\"card-b\">" +
+        esc(found.length) + "</span></div><div class=\"card-b\">" +
         (found.length ? found.map(function (s) { return snagRow(s, true); }).join("") :
           '<div class="empty">Nothing matches “' + esc(App.query) + "”.</div>") + "</div></div>";
     }
@@ -1972,16 +2045,16 @@ const UI = (function () {
         '<div class="card-h"><div style="min-width:0"><h2 style="text-transform:none;font-size:15px;letter-spacing:0">' +
         esc(p.name || "Untitled project") + "</h2>" +
         '<div class="muted mono">' + esc(p.code || "no code") + (p.client_name ? " · " + esc(p.client_name) : "") + "</div></div>" +
-        '<button class="btn btn-xs" data-a="edit-project" data-id="' + p.id + '">Edit</button></div>' +
+        '<button class="btn btn-xs" data-a="edit-project" data-id="' + esc(p.id) + '">Edit</button></div>' +
         '<div class="card-b">' + bar(t) +
         '<div class="chiprow" style="margin:9px 0 11px">' +
-        '<span class="count hr">' + t.outstanding + " open</span>" +
-        '<span class="count">' + t.hrOpen + " HR open</span>" +
-        '<span class="count ok">' + t.done + " done</span></div>" +
+        '<span class="count hr">' + esc(t.outstanding) + " open</span>" +
+        '<span class="count">' + esc(t.hrOpen) + " HR open</span>" +
+        '<span class="count ok">' + esc(t.done) + " done</span></div>" +
         (insps.length ? insps.map(inspectionRow).join("") :
           '<div class="muted" style="padding:6px 0 10px">No inspections yet.</div>') +
         '<div class="btn-row" style="margin-top:10px">' +
-        '<button class="btn btn-p btn-sm" data-a="new-inspection" data-id="' + p.id + '">＋ New inspection</button>' +
+        '<button class="btn btn-p btn-sm" data-a="new-inspection" data-id="' + esc(p.id) + '">＋ New inspection</button>' +
         "</div></div></div>";
     }).join("");
 
@@ -2003,12 +2076,12 @@ const UI = (function () {
 
   function inspectionRow(i) {
     const t = tally(snagsOf(i.id));
-    return '<button class="row" data-a="open-inspection" data-id="' + i.id + '">' +
+    return '<button class="row" data-a="open-inspection" data-id="' + esc(i.id) + '">' +
       '<div class="grow"><b>' + esc(i.type) + " · " + esc(i.inspection_date) + "</b>" +
       '<span class="sub">' + esc(i.number) + (i.area ? " · " + esc(i.area) : "") +
-      (i.rev ? " · Rev " + i.rev : "") + "</span></div>" +
+      (i.rev ? " · Rev " + esc(i.rev) : "") + "</span></div>" +
       '<span class="count' + (t.outstanding ? " hr" : " ok") + '">' +
-      (t.outstanding ? t.outstanding + " open" : t.total ? "done" : "empty") + "</span></button>";
+      (t.outstanding ? esc(t.outstanding) + " open" : t.total ? "done" : "empty") + "</span></button>";
   }
 
   /* -------------------------------------------------------------- snags --- */
@@ -2017,15 +2090,15 @@ const UI = (function () {
     const loc = [s.block_table, s.support_no ? "Supp " + s.support_no : "", s.location_text]
       .filter(Boolean).join(" · ");
     const thumb = (s.photos || []).length
-      ? '<img class="thumb" data-pid="' + s.photos[0] + '" alt="" />' : "";
-    return '<button class="rail r-' + s.risk + (done ? " done" : "") + '" data-a="open-snag" data-id="' + s.id + '">' +
+      ? '<img class="thumb" data-pid="' + esc(s.photos[0]) + '" alt="" />' : "";
+    return '<button class="rail r-' + esc(s.risk) + (done ? " done" : "") + '" data-a="open-snag" data-id="' + esc(s.id) + '">' +
       thumb +
-      '<span class="rh"><span class="num">' + s.snag_number + "</span>" +
+      '<span class="rh"><span class="num">' + esc(s.snag_number) + "</span>" +
       riskTag(s.risk) + statusTag(s.status) +
       (s.pin_x != null ? '<span class="tag" style="color:var(--ink-3)">pin</span>' : "") + "</span>" +
       '<span class="desc">' + esc(s.description || "(no description yet)") + "</span>" +
       '<span class="meta">' + esc(showCode ? s.code : loc || s.code) +
-      ((s.photos || []).length ? " · " + s.photos.length + "📷" : "") + "</span></button>";
+      ((s.photos || []).length ? " · " + esc(s.photos.length) + "📷" : "") + "</span></button>";
   }
 
   function viewSnags(insp) {
@@ -2049,12 +2122,12 @@ const UI = (function () {
     const last = all[all.length - 1];
     return '<div class="stack">' +
       '<div class="scroller">' + chips.map(function (c) {
-        return '<button class="chip' + (f === c[0] ? " on" : "") + '" data-a="filter" data-v="' + c[0] + '">' + esc(c[1]) + "</button>";
+        return '<button class="chip' + (f === c[0] ? " on" : "") + '" data-a="filter" data-v="' + esc(c[0]) + '">' + esc(c[1]) + "</button>";
       }).join("") + "</div>" +
       (all.length ? '<div class="card"><div class="card-b" style="padding:10px">' + bar(t) + "</div></div>" : "") +
       '<div class="btn-row">' +
       '<button class="btn btn-p" data-a="new-snag">＋ Add snag</button>' +
-      (last ? '<button class="btn" data-a="repeat-last">Repeat snag ' + last.snag_number + "</button>" : "") +
+      (last ? '<button class="btn" data-a="repeat-last">Repeat snag ' + esc(last.snag_number) + "</button>" : "") +
       "</div>" +
       "<div>" + list + "</div></div>";
   }
@@ -2064,7 +2137,7 @@ const UI = (function () {
     const st = Store.get();
     const p = projectOf(insp);
     const cover = insp.site_photo_id
-      ? '<img data-pid="' + insp.site_photo_id + '" data-a="view-photo" data-id="' + insp.site_photo_id + '" style="width:100%;border-radius:9px;border:1px solid var(--line)" alt="Site cover photo — tap to add a caption" />' +
+      ? '<img data-pid="' + esc(insp.site_photo_id) + '" data-a="view-photo" data-id="' + esc(insp.site_photo_id) + '" style="width:100%;border-radius:9px;border:1px solid var(--line)" alt="Site cover photo — tap to add a caption" />' +
       '<div class="btn-row" style="margin-top:8px"><button class="btn btn-sm" data-a="pick-photo" data-v="site">Library</button>' +
       '<button class="btn btn-sm" data-a="take-photo" data-v="site">Camera</button>' +
       '<button class="btn btn-sm btn-d" data-a="clear-photo" data-v="site">Remove</button></div>'
@@ -2081,7 +2154,7 @@ const UI = (function () {
       field("Inspection type", select("type", insp.type, INSPECTION_TYPES)) +
       field("Inspection date", dateField("inspection_date", insp.inspection_date)) +
       field("Next inspection", dateField("next_inspection_date", insp.next_inspection_date)) +
-      field("Inspector (" + esc(st.settings.company_name) + ")", input("inspector_name", insp.inspector_name)) +
+      field("Inspector (" + st.settings.company_name + ")", input("inspector_name", insp.inspector_name)) +
       field("Client / contractor QC", input("client_qc_name", insp.client_qc_name)) +
       "</div></div></div>" +
 
@@ -2096,7 +2169,7 @@ const UI = (function () {
       '<div class="card-b">' + textarea("technical_notes", insp.technical_notes, "Clauses, tolerances, torque notes", 5) + "</div></div>" +
 
       '<div class="card"><div class="card-h"><h2>Project</h2>' +
-      '<button class="btn btn-xs" data-a="edit-project" data-id="' + p.id + '">Edit project</button></div>' +
+      '<button class="btn btn-xs" data-a="edit-project" data-id="' + esc(p.id) + '">Edit project</button></div>' +
       '<div class="card-b muted">' + esc(p.name) + " · " + esc(p.code || "no code") +
       (p.client_name ? " · client " + esc(p.client_name) : "") + (p.location ? " · " + esc(p.location) : "") + "</div></div>" +
 
@@ -2112,22 +2185,22 @@ const UI = (function () {
 
     const pins = pinned.map(function (s) {
       const done = DONE.indexOf(s.status) >= 0;
-      return '<button class="pin r-' + s.risk + (done ? " done" : "") +
-        (App.snagId === s.id ? " sel" : "") + '" style="left:' + (s.pin_x * 100).toFixed(2) +
-        "%;top:" + (s.pin_y * 100).toFixed(2) + '%" data-a="open-snag" data-id="' + s.id + '">' +
-        s.snag_number + "</button>";
+      return '<button class="pin r-' + esc(s.risk) + (done ? " done" : "") +
+        (App.snagId === s.id ? " sel" : "") + '" style="left:' + pct(s.pin_x) +
+        "%;top:" + pct(s.pin_y) + '%" data-a="open-snag" data-id="' + esc(s.id) + '">' +
+        esc(s.snag_number) + "</button>";
     }).join("");
 
     const plan = insp.site_plan_id
       ? '<div class="planwrap' + (App.placing ? " placing" : "") + '" id="planwrap" data-a="plan-tap">' +
-      '<img data-pid="' + insp.site_plan_id + '" alt="Site plan" />' + pins + "</div>"
+      '<img data-pid="' + esc(insp.site_plan_id) + '" alt="Site plan" />' + pins + "</div>"
       : '<div class="planwrap' + (App.placing ? " placing" : "") + '" id="planwrap" data-a="plan-tap" ' +
       'style="min-height:230px;background-image:linear-gradient(#D8E0E8 1px,transparent 1px),linear-gradient(90deg,#D8E0E8 1px,transparent 1px);background-size:34px 34px">' +
       pins + '<div class="empty" style="pointer-events:none">No site plan loaded — pins land on a plain grid</div></div>';
 
     return '<div class="stack">' +
       (App.placing ? '<div class="banner info"><span>◎</span><span><b>Placing pin for snag ' +
-        ((snags.find(function (s) { return s.id === App.pinFor; }) || {}).snag_number || "") +
+        esc((snags.find(function (s) { return s.id === App.pinFor; }) || {}).snag_number || "") +
         "</b>Tap the plan where it is. Tap “Stop placing” to cancel.</span></div>" : "") +
       plan +
       '<div class="btn-row">' +
@@ -2136,12 +2209,12 @@ const UI = (function () {
       (insp.site_plan_id ? '<button class="btn btn-sm btn-d" data-a="clear-photo" data-v="plan">Remove plan</button>' : "") +
       (App.placing ? '<button class="btn btn-sm btn-n" data-a="stop-placing">Stop placing</button>' : "") +
       "</div>" +
-      '<div class="card"><div class="card-h"><h2>Unpinned snags</h2><span class="count">' + unpinned.length + "</span></div>" +
+      '<div class="card"><div class="card-h"><h2>Unpinned snags</h2><span class="count">' + esc(unpinned.length) + "</span></div>" +
       '<div class="card-b">' + (unpinned.length ? unpinned.map(function (s) {
-        return '<button class="row" data-a="place-pin" data-id="' + s.id + '">' +
+        return '<button class="row" data-a="place-pin" data-id="' + esc(s.id) + '">' +
           '<span class="num" style="background:var(--' + (s.risk === "HR" ? "hr" : "lr") + ');color:#fff;font-family:var(--mono);' +
           'min-width:26px;height:22px;border-radius:5px;display:inline-flex;align-items:center;justify-content:center">' +
-          s.snag_number + "</span>" +
+          esc(s.snag_number) + "</span>" +
           '<div class="grow"><b>' + esc(s.description || "(no description)") + "</b>" +
           '<span class="sub">' + esc(s.block_table || s.code) + "</span></div>" +
           '<span class="count">Place</span></button>';
@@ -2162,18 +2235,18 @@ const UI = (function () {
       "<span><b>" + (pf.ready ? "Ready to issue" : "Not ready to issue") + "</b>" +
       (pf.ready ? "Everything the report needs is present." : "Fix the items marked ✕ below, then export.") + "</span></div>" +
 
-      '<div class="card"><div class="card-h"><h2>Pre-flight</h2><span class="count">' + t.total + " snags</span></div>" +
+      '<div class="card"><div class="card-h"><h2>Pre-flight</h2><span class="count">' + esc(t.total) + " snags</span></div>" +
       '<div class="card-b">' + pf.checks.map(function (c) {
-        return '<div class="check ' + c.level + '"><span class="m">' +
+        return '<div class="check ' + esc(c.level) + '"><span class="m">' +
           (c.level === "pass" ? "✓" : c.level === "warn" ? "!" : "✕") + "</span><span>" + esc(c.text) +
           (c.fix ? '<span class="muted" style="display:block">' + esc(c.fix) + "</span>" : "") + "</span></div>";
       }).join("") + "</div></div>" +
 
-      '<div class="card"><div class="card-h"><h2>Word packs</h2><span class="mono muted">Rev ' + (insp.rev || 0) + "</span></div>" +
+      '<div class="card"><div class="card-h"><h2>Word packs</h2><span class="mono muted">Rev ' + esc(insp.rev || 0) + "</span></div>" +
       '<div class="card-b stack">' +
-      '<button class="btn btn-p" data-a="export" data-v="full">Full report — all ' + t.total + " items</button>" +
-      '<button class="btn" data-a="export" data-v="open">Open items only — ' + t.outstanding + "</button>" +
-      '<button class="btn" data-a="export" data-v="closeout">Close-out pack — ' + t.done + " verified</button>" +
+      '<button class="btn btn-p" data-a="export" data-v="full">Full report — all ' + esc(t.total) + " items</button>" +
+      '<button class="btn" data-a="export" data-v="open">Open items only — ' + esc(t.outstanding) + "</button>" +
+      '<button class="btn" data-a="export" data-v="closeout">Close-out pack — ' + esc(t.done) + " verified</button>" +
       '<button class="btn" data-a="export-csv">CSV register (Excel)</button>' +
       '<p class="muted">Files land in your Downloads folder. Filename: ' +
       '<span class="mono">' + esc(Report.fileBase(insp, "full", insp.rev || 0)) + ".docx</span></p>" +
@@ -2182,8 +2255,8 @@ const UI = (function () {
       '<div class="card"><div class="card-h"><h2>Revisions</h2>' +
       '<button class="btn btn-xs" data-a="new-revision">＋ Issue revision</button></div>' +
       '<div class="card-b">' + (revs.length ? revs.map(function (r) {
-        return '<div class="row" style="cursor:default"><div class="grow"><b>Rev ' + r.rev + " — " + esc(r.reason || "no reason given") + "</b>" +
-          '<span class="sub">' + esc(localStamp(r.created_at)) + " · " + r.snag_count + " items · " + esc(r.by || "") + "</span></div></div>";
+        return '<div class="row" style="cursor:default"><div class="grow"><b>Rev ' + esc(r.rev) + " — " + esc(r.reason || "no reason given") + "</b>" +
+          '<span class="sub">' + esc(localStamp(r.created_at)) + " · " + esc(r.snag_count) + " items · " + esc(r.by || "") + "</span></div></div>";
       }).join("") : '<div class="muted">No revision issued yet. Issuing one stamps the revision number onto the header and footer of the exported Word file.</div>') +
       "</div></div>" +
       "</div>";
@@ -2196,7 +2269,7 @@ const UI = (function () {
       '<div class="card"><div class="card-h"><h2>Snag templates</h2>' +
       '<button class="btn btn-xs" data-a="edit-template" data-id="new">＋ Add</button></div>' +
       '<div class="card-b">' + st.templates.map(function (t) {
-        return '<button class="rail r-' + t.risk + '" data-a="edit-template" data-id="' + t.id + '">' +
+        return '<button class="rail r-' + esc(t.risk) + '" data-a="edit-template" data-id="' + esc(t.id) + '">' +
           '<span class="rh">' + riskTag(t.risk) + '<span class="tag" style="color:var(--ink-3)">' + esc(t.category || "—") + "</span></span>" +
           '<span class="desc">' + esc(t.label) + "</span>" +
           '<span class="meta">' + esc((t.description || "").slice(0, 90)) + "</span></button>";
@@ -2205,7 +2278,7 @@ const UI = (function () {
       '<div class="card"><div class="card-h"><h2>Remarks & technical notes</h2>' +
       '<button class="btn btn-xs" data-a="edit-remark" data-id="new">＋ Add</button></div>' +
       '<div class="card-b">' + st.remarks.map(function (r) {
-        return '<button class="row" data-a="edit-remark" data-id="' + r.id + '">' +
+        return '<button class="row" data-a="edit-remark" data-id="' + esc(r.id) + '">' +
           '<div class="grow"><b>' + esc(r.title) + "</b>" +
           '<span class="sub">' + (r.kind === "remark" ? "Remark" : "Technical note") +
           (r.source ? " · " + esc(r.source) : "") + "</span></div></button>";
@@ -2219,13 +2292,13 @@ const UI = (function () {
   /* ------------------------------------------------------------- settings -- */
   function viewSettings(usage) {
     const s = Store.get().settings;
-    const pct = usage && usage.quota ? Math.min(100, usage.used / usage.quota * 100) : 0;
+    const used = usage && usage.quota ? usage.used / usage.quota : 0;
     return '<div class="stack">' +
       '<div class="card"><div class="card-h"><h2>Storage on this device</h2></div><div class="card-b">' +
-      '<div class="bar"><i class="done" style="width:' + pct.toFixed(2) + '%"></i></div>' +
+      '<div class="bar"><i class="done" style="width:' + pct(used) + '%"></i></div>' +
       '<p class="muted" style="margin:8px 0 0">' +
       (usage ? esc(fmtBytes(usage.used) + " used" + (usage.quota ? " of about " + fmtBytes(usage.quota) + " available" : "")) +
-        " · " + usage.photoCount + " photos (" + esc(fmtBytes(usage.photoBytes)) + ")" : "Measuring…") + "</p>" +
+        " · " + esc(usage.photoCount) + " photos (" + esc(fmtBytes(usage.photoBytes)) + ")" : "Measuring…") + "</p>" +
       '<div class="banner warn" style="margin-top:10px"><span>!</span><span><b>Chrome can clear this</b>' +
       "Clearing site data, or uninstalling the app, deletes every inspection on this device. Export a backup after each site visit.</span></div>" +
       "</div></div>" +
@@ -2388,7 +2461,7 @@ const UI = (function () {
       '<input class="inp" id="tplq" placeholder="Filter templates" style="margin-bottom:10px" />' +
       '<button class="btn btn-n" data-a="create-snag" data-id="" style="width:100%;margin-bottom:10px">Blank snag</button>' +
       '<div id="tpllist">' + list.map(function (t) {
-        return '<button class="rail r-' + t.risk + '" data-a="create-snag" data-id="' + t.id + '" data-label="' +
+        return '<button class="rail r-' + esc(t.risk) + '" data-a="create-snag" data-id="' + esc(t.id) + '" data-label="' +
           esc((t.label + " " + t.description + " " + t.category).toLowerCase()) + '">' +
           '<span class="rh">' + UI.riskTag(t.risk) +
           '<span class="tag" style="color:var(--ink-3)">' + esc(t.category || "—") + "</span></span>" +
@@ -2413,15 +2486,15 @@ const UI = (function () {
     const done = DONE.indexOf(s.status) >= 0;
 
     const photos = (s.photos || []).map(function (pid) {
-      return '<div class="photocell"><img data-pid="' + pid + '" alt="" data-a="view-photo" data-id="' + pid + '" />' +
-        '<span class="k" data-a="cycle-kind" data-id="' + pid + '">…</span>' +
-        '<button class="x" data-a="del-photo" data-id="' + pid + '" title="Remove photo">×</button></div>';
+      return '<div class="photocell"><img data-pid="' + esc(pid) + '" alt="" data-a="view-photo" data-id="' + esc(pid) + '" />' +
+        '<span class="k" data-a="cycle-kind" data-id="' + esc(pid) + '">…</span>' +
+        '<button class="x" data-a="del-photo" data-id="' + esc(pid) + '" title="Remove photo">×</button></div>';
     }).join("");
 
     const refs = (s.references || []).map(function (r, i) {
       return '<div class="row" style="cursor:default"><div class="grow"><b>' + esc(r.document || "—") + "</b>" +
         '<span class="sub">' + esc(r.detail || "") + "</span></div>" +
-        '<button class="btn btn-xs btn-d" data-a="del-ref" data-v="' + i + '">Remove</button></div>';
+        '<button class="btn btn-xs btn-d" data-a="del-ref" data-v="' + esc(i) + '">Remove</button></div>';
     }).join("");
 
     const statusBtns = [
@@ -2431,7 +2504,7 @@ const UI = (function () {
       ["open", "Reopen", ""],
     ].filter(function (b) { return b[0] !== s.status; })
       .map(function (b) {
-        return '<button class="btn btn-sm ' + b[2] + '" data-a="set-status" data-v="' + b[0] + '">' + b[1] + "</button>";
+        return '<button class="btn btn-sm ' + esc(b[2]) + '" data-a="set-status" data-v="' + esc(b[0]) + '">' + esc(b[1]) + "</button>";
       }).join("");
 
     const history = (s.history || []).slice().reverse().map(function (h) {
@@ -2441,7 +2514,7 @@ const UI = (function () {
     }).join("");
 
     UI.openModal(
-      '<div class="sheet-h"><h2>Snag ' + s.snag_number + "</h2>" +
+      '<div class="sheet-h"><h2>Snag ' + esc(s.snag_number) + "</h2>" +
       UI.riskTag(s.risk) + UI.statusTag(s.status) +
       '<button class="btn btn-sm" data-a="close-modal">Done</button></div>' +
       '<div class="sheet-b">' +
@@ -2477,12 +2550,12 @@ const UI = (function () {
       '<div class="btn-row" style="margin-bottom:8px">' +
       '<button class="btn btn-sm" data-a="gps">' + (s.lat != null ? "Update GPS" : "Capture GPS") + "</button>" +
       '<button class="btn btn-sm" data-a="enter-gps">Enter coordinates</button>' +
-      '<button class="btn btn-sm" data-a="place-pin" data-id="' + s.id + '">' + (s.pin_x != null ? "Move pin" : "Place pin on plan") + "</button>" +
+      '<button class="btn btn-sm" data-a="place-pin" data-id="' + esc(s.id) + '">' + (s.pin_x != null ? "Move pin" : "Place pin on plan") + "</button>" +
       (s.pin_x != null ? '<button class="btn btn-sm btn-d" data-a="clear-pin">Clear pin</button>' : "") +
       "</div>" +
       '<div class="muted mono">' +
-      (s.lat != null ? "GPS " + Number(s.lat).toFixed(6) + ", " + Number(s.lng).toFixed(6) +
-        (s.gps_accuracy ? " ±" + Math.round(s.gps_accuracy) + "m" : "") : "No GPS captured") +
+      (s.lat != null ? esc("GPS " + Number(s.lat).toFixed(6) + ", " + Number(s.lng).toFixed(6) +
+        (s.gps_accuracy ? " ±" + Math.round(s.gps_accuracy) + "m" : "")) : "No GPS captured") +
       (s.pin_x != null ? " · pin set" : " · no pin") + "</div></div></div>" +
 
       (history ? '<div class="card" style="margin-bottom:12px"><div class="card-h"><h2>History</h2></div>' +
@@ -2499,7 +2572,7 @@ const UI = (function () {
     // Show each photo's kind label.
     (s.photos || []).forEach(function (pid) {
       Store.getPhoto(pid).then(function (p) {
-        const el = document.querySelector('.k[data-id="' + pid + '"]');
+        const el = document.querySelector('.k[data-id="' + CSS.escape(pid) + '"]');
         if (el && p) el.textContent = p.kind === "closeout" ? "Close-out" : p.kind === "after" ? "After" : "Before";
       });
     });
@@ -2557,7 +2630,7 @@ const UI = (function () {
     const list = Store.get().remarks.filter(function (r) { return r.kind === kind; });
     UI.openModal(UI.sheetHead(kind === "remark" ? "Insert general remark" : "Insert technical note") +
       '<div class="sheet-b">' + (list.length ? list.map(function (r) {
-        return '<button class="row" data-a="use-remark" data-id="' + r.id + '"><div class="grow"><b>' +
+        return '<button class="row" data-a="use-remark" data-id="' + esc(r.id) + '"><div class="grow"><b>' +
           esc(r.title) + "</b><span class=\"sub\">" + esc((r.body || "").slice(0, 70)) + "…</span></div></button>";
       }).join("") : '<div class="empty">Nothing in the library for this yet.</div>') + "</div>");
   }
@@ -2715,7 +2788,7 @@ const UI = (function () {
     for (let d = 1; d <= days; d++) {
       const v = ymd(y, mo, d);
       const cls = (value === v ? " on" : "") + (todayStr === v ? " today" : "");
-      cells += '<button type="button" class="' + cls.trim() + '" data-a="pick-date" data-v="' + v + '">' + d + "</button>";
+      cells += '<button type="button" class="' + cls.trim() + '" data-a="pick-date" data-v="' + esc(v) + '">' + d + "</button>";
     }
     const title = field === "due_date" ? "Due date" : field === "next_inspection_date" ? "Next inspection" : "Inspection date";
     UI.openModal(
@@ -2723,7 +2796,7 @@ const UI = (function () {
       '<div class="sheet-b">' +
       '<div class="cal-nav">' +
       '<button class="btn btn-sm" data-a="date-prev">‹</button>' +
-      "<b>" + months[mo] + " " + y + "</b>" +
+      "<b>" + esc(months[mo] + " " + y) + "</b>" +
       '<button class="btn btn-sm" data-a="date-next">›</button></div>' +
       '<div class="cal">' + cells + "</div>" +
       '<div class="btn-row" style="margin-top:12px">' +
@@ -3026,7 +3099,7 @@ const UI = (function () {
       const fromSnag = App.modal && App.modal.type === "snag";
       if (!fromSnag) App.modal = { type: "photo", id: pid };   // so Escape closes it
       UI.openModal(UI.sheetHead("Photo") + '<div class="sheet-b">' +
-        '<img src="' + url + '" style="width:100%;border-radius:9px" alt="" />' +
+        '<img src="' + esc(url) + '" style="width:100%;border-radius:9px" alt="" />' +
         UI.field("Caption", UI.input("ph." + pid, (p && p.caption) || "", { placeholder: "Shown under the photo in the report" })) +
         (fromSnag ? '<button class="btn" data-a="back-to-snag">Back to snag</button>'
           : '<button class="btn" data-a="close-modal">Done</button>') + "</div>");
@@ -3243,7 +3316,7 @@ const UI = (function () {
       s[name] = value;
       s.updated_at = new Date().toISOString();
       if (name === "description" || name === "block_table") {
-        const row = document.querySelector('[data-a="open-snag"][data-id="' + s.id + '"] .desc');
+        const row = document.querySelector('[data-a="open-snag"][data-id="' + CSS.escape(s.id) + '"] .desc');
         if (row && name === "description") row.textContent = value || "(no description yet)";
       }
     } else {
