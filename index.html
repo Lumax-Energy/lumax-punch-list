@@ -230,6 +230,13 @@ textarea.inp{min-height:82px;resize:vertical;line-height:1.4}
   border:2px dashed var(--line);border-radius:var(--r);padding:16px;text-align:center;
   color:var(--ink-3);font-size:13px;background:var(--surface);
 }
+/* Dragging files in only happens with a mouse, so the hint is desktop-only. */
+.drop-hint{display:none}
+@media (hover:hover) and (pointer:fine){
+  .dropzone .drop-hint{display:block;font-size:11px;margin-top:4px}
+  p .drop-hint{display:inline}
+}
+[data-drop].over{outline:3px dashed var(--steel);outline-offset:3px;border-radius:var(--r)}
 
 /* ── plan / pins ───────────────────────────────────────────────────────── */
 .planwrap{position:relative;background:var(--band);border:1px solid var(--line);
@@ -3084,7 +3091,8 @@ const UI = (function () {
       '<div class="btn-row" style="margin-top:8px"><button class="btn btn-sm" data-a="pick-photo" data-v="site">Library</button>' +
       '<button class="btn btn-sm" data-a="take-photo" data-v="site">Camera</button>' +
       '<button class="btn btn-sm btn-d" data-a="clear-photo" data-v="site">Remove</button></div>'
-      : '<div class="photogrid"><button class="dropzone" data-a="pick-photo" data-v="site" style="min-height:104px">Library</button>' +
+      : '<div class="photogrid"><button class="dropzone" data-a="pick-photo" data-v="site" style="min-height:104px">Library' +
+      '<span class="drop-hint">or drop a photo here</span></button>' +
       '<button class="dropzone" data-a="take-photo" data-v="site" style="min-height:104px">Camera</button></div>' +
       '<p class="muted" style="margin:8px 0 0">Wide shot for page 1 of the report</p>';
 
@@ -3104,7 +3112,7 @@ const UI = (function () {
       field("Client / contractor QC", input("client_qc_name", insp.client_qc_name)) +
       "</div></div></div>" +
 
-      '<div class="card"><div class="card-h"><h2>Site cover photo</h2></div><div class="card-b">' + cover + "</div></div>" +
+      '<div class="card"><div class="card-h"><h2>Site cover photo</h2></div><div class="card-b" data-drop="site">' + cover + "</div></div>" +
 
       '<div class="card"><div class="card-h"><h2>General remarks</h2>' +
       '<button class="btn btn-xs" data-a="insert-remark" data-v="remark">Insert standard</button></div>' +
@@ -3140,9 +3148,9 @@ const UI = (function () {
     checkPhotos(insp, "plan");
     const planGone = Report.photoMissing(insp.site_plan_id);
     const plan = insp.site_plan_id && !planGone
-      ? '<div class="planwrap' + (App.placing ? " placing" : "") + '" id="planwrap" data-a="plan-tap">' +
+      ? '<div class="planwrap' + (App.placing ? " placing" : "") + '" id="planwrap" data-a="plan-tap" data-drop="plan">' +
       '<img data-pid="' + esc(insp.site_plan_id) + '" alt="Site plan" />' + pins + "</div>"
-      : '<div class="planwrap' + (App.placing ? " placing" : "") + '" id="planwrap" data-a="plan-tap" ' +
+      : '<div class="planwrap' + (App.placing ? " placing" : "") + '" id="planwrap" data-a="plan-tap" data-drop="plan" ' +
       'style="min-height:230px;background-image:linear-gradient(#D8E0E8 1px,transparent 1px),linear-gradient(90deg,#D8E0E8 1px,transparent 1px);background-size:34px 34px">' +
       pins + '<div class="empty" style="pointer-events:none">' + (planGone
         ? "The site plan image is not on this device — restore the full backup (…_full.zip). Pins show on a plain grid"
@@ -3169,7 +3177,8 @@ const UI = (function () {
           '<span class="sub">' + esc(s.block_table || s.code) + "</span></div>" +
           '<span class="count">Place</span></button>';
       }).join("") : '<div class="muted">Every snag has a pin.</div>') + "</div></div>" +
-      '<p class="muted">Pin colour follows risk, and turns green when the snag is verified — the same on the plan, in the list and in the Word report.</p>' +
+      '<p class="muted">Pin colour follows risk, and turns green when the snag is verified — the same on the plan, in the list and in the Word report.' +
+      '<span class="drop-hint"> On a computer, drag a plan image onto the plan to load or replace it.</span></p>' +
       "</div>";
   }
 
@@ -3566,8 +3575,9 @@ const UI = (function () {
       '<button class="btn btn-sm" data-a="close-modal">Done</button></div>' +
       '<div class="sheet-b">' +
 
-      '<div class="photogrid" style="margin-bottom:10px">' + photos +
-      '<button class="dropzone" data-a="pick-photo" data-v="snag" style="min-height:104px">Library</button>' +
+      '<div class="photogrid" style="margin-bottom:10px" data-drop="snag">' + photos +
+      '<button class="dropzone" data-a="pick-photo" data-v="snag" style="min-height:104px">Library' +
+      '<span class="drop-hint">or drop photos here</span></button>' +
       '<button class="dropzone" data-a="take-photo" data-v="snag" style="min-height:104px">Camera</button></div>' +
       '<p class="muted" style="margin:-4px 0 12px">Library picks from the phone. Camera opens the camera.' + kindNote + "</p>" +
 
@@ -3735,7 +3745,14 @@ const UI = (function () {
   async function addPhotos(target, kindHint, useCamera) {
     // The site cover and plan hold one image each, so ask for one file only.
     const single = target === "site" || target === "plan";
-    const files = (await pickFile("image/*", !!useCamera, single)).slice(0, single ? 1 : undefined);
+    const files = await pickFile("image/*", !!useCamera, single);
+    await addFiles(target, kindHint, files);
+  }
+  /** Store picked or dropped image files on the snag sheet that is open, or
+   *  as the inspection's cover or plan (first file only). */
+  async function addFiles(target, kindHint, files) {
+    const single = target === "site" || target === "plan";
+    files = files.slice(0, single ? 1 : undefined);
     if (!files.length) return;
     UI.toast("Processing " + files.length + " photo" + (files.length > 1 ? "s" : "") + "…");
     const i = insp();
@@ -4659,6 +4676,43 @@ const UI = (function () {
       // Redraw the open sheet too, so its header risk tag matches the new Impact.
       if (App.modal && App.modal.type === "snag") snagSheet(App.modal.id);
     }
+  });
+
+  // Files dragged from the desktop onto a photo area ([data-drop]: a snag's
+  // photo grid, the cover card or the plan). Only drags that carry files count.
+  function dropZone(ev) {
+    const types = ev.dataTransfer ? ev.dataTransfer.types : null;
+    if (!types || Array.prototype.indexOf.call(types, "Files") < 0) return null;
+    return ev.target && ev.target.closest ? ev.target.closest("[data-drop]") : null;
+  }
+  function clearOver() {
+    document.querySelectorAll("[data-drop].over").forEach(function (el) { el.classList.remove("over"); });
+  }
+  document.addEventListener("dragover", function (ev) {
+    // Claim every drag: a file dropped outside a zone would otherwise open in
+    // this tab and take the app with it.
+    ev.preventDefault();
+    const z = dropZone(ev);
+    if (ev.dataTransfer) ev.dataTransfer.dropEffect = z ? "copy" : "none";
+    if (!z) { clearOver(); return; }
+    if (!z.classList.contains("over")) { clearOver(); z.classList.add("over"); }
+  });
+  document.addEventListener("dragleave", function (ev) {
+    if (!ev.relatedTarget) clearOver();   // the drag left the window
+  });
+  document.addEventListener("drop", function (ev) {
+    ev.preventDefault();
+    clearOver();
+    const z = dropZone(ev);
+    if (!z) return;
+    const files = Array.prototype.slice.call(ev.dataTransfer.files || []);
+    const images = files.filter(function (f) {
+      return /^image\//.test(f.type) || /\.(jpe?g|png|gif|webp|bmp|heic|heif)$/i.test(f.name);
+    });
+    if (!images.length) { UI.toast("Drop image files (JPG, PNG)", true); return; }
+    if (images.length < files.length) UI.toast((files.length - images.length) + " file" + (files.length - images.length > 1 ? "s" : "") + " skipped: not an image");
+    const target = z.getAttribute("data-drop");
+    addFiles(target, target === "snag" ? "" : target, images);
   });
 
   document.addEventListener("keydown", function (ev) {
